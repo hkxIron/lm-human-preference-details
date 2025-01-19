@@ -29,7 +29,9 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-
+"""
+可以用作rlhf ppo的教学代码，写得很漂亮，易懂
+"""
 @dataclass
 class AdaptiveKLParams:
     target: float = 6.0
@@ -289,7 +291,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, val=bias_const)
     return layer
 
-
 class AdaptiveKLController:
     def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
         self.value = init_kl_coef
@@ -310,16 +311,22 @@ def whiten(values, shift_mean=True):
         whitened += mean
     return whitened
 
-
+#
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
         self.lm_backbone = lm_backbone
+        # 这个scalar_head是用来计算critic value的
         self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        return output, self.scalar_head(output.hidden_states[-1])
+        # top_hidden_states:[batch_size, seq_len, hidden_size]
+        top_hidden_states = output.hidden_states[-1]
+        # critic_value:[batch_size, seq_len, 1]
+        # 注意：这里是对每个token都会有一个value打分,即critic的V(st)需要
+        critic_value = self.scalar_head(top_hidden_states)
+        return output, critic_value
 
 
 class AutoModelForCausalLMWithRewardHead(nn.Module):
@@ -335,8 +342,9 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
+        # layer* [batch, length, hidden_size], 注意reward model只取最后一层的hidden_state
         reward_latents = output.hidden_states[-1]
-        # shape: [batch_size, length, hidden_size]
+        # shape: [batch_size, length, hidden_size], 注意：reward model只取最后一层的hidden_state的最后一个token进行打分
         last_reward_latents = reward_latents[:, -1, :]
         # shape: [batch_size, hidden_size]
         reward = self.scalar_head(last_reward_latents)
@@ -378,6 +386,9 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         return_dict_in_generate=True,
     )
     # restore padding tokens
+    # 只要生成的answer部分
+    # queries:[batch, query_len]
+    # response:[batch, resp_len]
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
@@ -559,6 +570,7 @@ def train(args: Args):
         with torch.no_grad():
             queries = data["query_token"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            # [batch, query_len + resp_len]
             query_responses = generate(
                 accelerator.unwrap_model(policy).lm_backbone,
                 queries,
@@ -568,8 +580,9 @@ def train(args: Args):
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
-            output, full_values = forward(policy, query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
+            # policy model output
+            output, critic_full_values = forward(policy, query_responses, tokenizer)
+            critic_values = critic_full_values[:, context_length - 1: -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
@@ -577,6 +590,7 @@ def train(args: Args):
             del output, logits, all_logprobs
             torch.cuda.empty_cache()
 
+            # ref_policy model output
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
             ref_logits /= args.task.temperature
@@ -608,16 +622,17 @@ def train(args: Args):
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = right_padding_to_left_padding(
-                postprocessed_query_responses, tokenizer.pad_token_id
-            )
+            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
+            # scores:[batch], 利用query+resp计算score
             scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)[1].flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
+            # 即：只有含有truncate_token的才有正常的reward
             matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
             filter_mask = torch.any(matches_token, dim=-1)
+            # scores:[batch]
             scores = torch.where(
                 filter_mask,
                 scores,
@@ -627,10 +642,13 @@ def train(args: Args):
             torch.cuda.empty_cache()
 
             # 4. compute rewards
+            # kl:[batch, seq_len]
             kl = logprobs - ref_logprobs
-            non_score_reward = -kl_ctl.value * kl
+            non_score_reward = -kl_ctl.value * kl # negative kl-penalty reward
+
+            # rewards:[batch, seq_len]
             rewards = non_score_reward.clone()
-            rewards[:, -1] += scores
+            rewards[:, -1] += scores # 最后一人token的reward 加上每条样本的reward
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
@@ -638,14 +656,18 @@ def train(args: Args):
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
+                    # query
                     all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
                     all_postprocessed_query_responses = tokenizer.batch_decode(
                         postprocessed_query_responses, skip_special_tokens=True
                     )
+                    # response
                     all_postprocessed_responses = [
                         x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
                     ]
 
+                    # kl:[batch, seq_len]
+                    # kl_sum:[batch]
                     kl_sum = kl.sum(axis=1)
                     all_df = pd.DataFrame(
                         {
@@ -672,19 +694,43 @@ def train(args: Args):
             torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
+            """
+            A(st,at) = sum_{t} {lamada*gamma}^{l}*delta_{t+l}
+            delta_{t} = r(st, at) + gamma* V(s(t+1)) - V(st)
+            R(t) = A(st, at) + V(st)
+
+            假设序列为1,2,3...T-1,T
+            1.t=T
+            delta_{T} = r(s(T),a(T)) + 0 - V(S(T))
+            A(s(T+1),a(T+1)) = delta_{T}
+
+            2.t=T-1
+            delta_{T-1} = r(s(T-1),a(T-1)) + gamma*V(s(T)) - V(S(T-1))
+            A(s(T-1),a(T-1)) = delta_{T-1} + lamada*gamma*delta_{T}
+            = delta_{T-1} + lamada*gamma* A(s(T+1),a(T+1)) 
+
+            3.t=T-2
+            delta_{T-2} = r(s(T-2),a(T-2)) + gamma*V(s(T-1)) - V(S(T-2))
+            A(s(T-2),a(T-2)) = delta_{T-2} + (lamada*gamma)*delta_{T-1} + (lamada*gamma)^2*delta_{T}
+            = delta_{T-2} + (lamada*gamma)* A(s(T-1),a(T-1)), 即递归表示
+
+            rewards:[seq_len, seq_len]
+            """
             lastgaelam = 0
             advantages_reversed = []
             gen_length = args.task.response_length
             for t in reversed(range(gen_length)):
-                nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
+                nextvalues = critic_values[:, t + 1] if t < gen_length - 1 else 0.0
+                delta = rewards[:, t] + args.ppo.gamma * nextvalues - critic_values[:, t]
                 lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
                 advantages_reversed.append(lastgaelam)
             advantages = torch.stack(advantages_reversed[::-1], axis=1)
-            returns = advantages + values
+            # R(t) = A(st, at) + V(st)
+            # returns:[batch, seq_len]
+            returns = advantages + critic_values
             advantages = whiten(advantages)
             return_mean, return_var = returns.mean(), returns.var()
-            value_mean, value_var = values.mean(), values.var()
+            value_mean, value_var = critic_values.mean(), critic_values.var()
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -700,17 +746,18 @@ def train(args: Args):
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
                         mb_advantage = advantages[micro_batch_inds]
-                        mb_values = values[micro_batch_inds]
+                        mb_values = critic_values[micro_batch_inds]
                         mb_responses = responses[micro_batch_inds]
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
 
-                        output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
+                        # 用当前的policy进行预测
+                        output, vpred_critic_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= args.task.temperature
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                        vpred = vpred_critic_temp[:, context_length - 1: -1].squeeze(-1)
                         vpredclipped = torch.clamp(
                             vpred,
                             mb_values - args.ppo.cliprange_value,
@@ -718,19 +765,25 @@ def train(args: Args):
                         )
                         vf_losses1 = torch.square(vpred - mb_return)
                         vf_losses2 = torch.square(vpredclipped - mb_return)
+                        # critic预测的value值不能差太多, 即V(st)
                         vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
-                        vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
+                        vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()  # 计算clip的比例
+
+                        # policy ppo loss
                         logprobs_diff = new_logprobs - mb_logprobs
                         ratio = torch.exp(logprobs_diff)
                         pg_losses = -mb_advantage * ratio
                         pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         pg_loss = torch.max(pg_losses, pg_losses2).mean()
-                        pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
+
+                        pg_clipfrac = (pg_losses2 > pg_losses).float().mean() # 计算clip的比例
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
+
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                        # 计算policy的熵,熵越大，代表policy多样性越高
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         with torch.no_grad():

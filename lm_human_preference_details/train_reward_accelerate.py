@@ -36,7 +36,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 class LabelHParams:
     type: str = None
     num_train: int = 4992
-    num_labels: int = 4
+    num_labels: int = 4 # 每个quers会生成多个response label
     source: str = None
 
 
@@ -286,15 +286,18 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
         self.lm_backbone = lm_backbone
+        # [hidden_size, 1]
         self.scalar_head = layer_init(
             nn.Linear(lm_backbone.config.hidden_size, 1),
-            std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
+            std=1 / np.sqrt(lm_backbone.config.hidden_size + 1), # sqrt(fin + fout)
         )
+        # 注意：这里的scale与bias是可以学习的参数
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
+        # layer*[batch, seq_len, hidden_dim]
         reward_latents = output.hidden_states[-1]
         # shape: [batch_size, length, hidden_size]
         last_reward_latents = reward_latents[:, -1, :]
@@ -305,7 +308,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         return output, reward
 
 
-def right_padding_to_left_padding(tokens, pad_id):
+def right_padding_to_left_padding(tokens:List[List[int]], pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
     return torch.tensor(
@@ -469,6 +472,7 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
+    # 在blog中说，openai的原始实现中即使遇到eos token,生成时也不会停止生成token
     untrained_model.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -493,7 +497,11 @@ def train(args: Args):
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         return {
             "query_token": tokenizer(
-                x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
+                x["text"],
+                padding="max_length",
+                max_length=response_length,
+                truncation=True,
+                return_tensors="pt"
             )["input_ids"],
         }
 
@@ -610,6 +618,7 @@ def train(args: Args):
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
                     query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
+                    # 用query+response来预测reward
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(reward.view(-1))
                 predicted_rewards = torch.stack(
@@ -671,6 +680,7 @@ def train(args: Args):
                 # the part below is testing out some generations and KLs, not presented in the original code
                 data = next(iter_dataloader)
                 queries = data["query_token"].to(device)
+                # queries:[batch, query_len]
                 context_length = queries.shape[1]
                 queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
                 query_responses = generate(
@@ -679,25 +689,35 @@ def train(args: Args):
                     tokenizer,
                     generation_config,
                 )
+                # 去掉query本身，只取输出response
                 responses = query_responses[:, context_length:]
 
+                # 使用query+response 来训练reward模型
                 output, reward = get_reward(reward_model, query_responses, tokenizer)
+                # logits:[batch, seq_len, vocab_size]
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
+                # 计算所有response的logprobs
+                # logprobs:[batch, seq_len]
                 logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
+                # 计算原来base lm model的reward
                 output, _ = get_reward(untrained_model, query_responses, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
+                # ref_logprobs:[batch, seq_len]
                 ref_logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
+                # 计算reward model与base lm model的per token的kl 散度
+                # kl:[batch, seq_len]
                 kl = logprobs - ref_logprobs
+                # kl_sum:[batch,1]
                 kl_sum = kl.sum(axis=1)
                 all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
                 all_query_responses = tokenizer.batch_decode(query_responses, skip_special_tokens=True)
