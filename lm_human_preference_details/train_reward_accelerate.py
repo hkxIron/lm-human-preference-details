@@ -22,11 +22,11 @@ from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
 from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
+# from torch.optim.optimizer import (
+#     _dispatch_sqrt,
+#     _get_value,
+#     _use_grad_for_differentiable,
+# )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -73,11 +73,12 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     label_dataset: str = "sentiment/offline_5k.json"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
-    local_batch_size: int = 4
+    local_batch_size: int = 1
     """per rank batch size"""
     gradient_accumulation_steps: int = 1
     """gradient accumulation steps"""
@@ -128,152 +129,152 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     console.print(table)
 
 
-def _single_tensor_adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    grad_scale: Optional[Tensor],
-    found_inf: Optional[Tensor],
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-    capturable: bool,
-    differentiable: bool,
-):
-    assert grad_scale is None and found_inf is None
+# def _single_tensor_adam(
+#     params: List[Tensor],
+#     grads: List[Tensor],
+#     exp_avgs: List[Tensor],
+#     exp_avg_sqs: List[Tensor],
+#     max_exp_avg_sqs: List[Tensor],
+#     state_steps: List[Tensor],
+#     grad_scale: Optional[Tensor],
+#     found_inf: Optional[Tensor],
+#     *,
+#     amsgrad: bool,
+#     beta1: float,
+#     beta2: float,
+#     lr: float,
+#     weight_decay: float,
+#     eps: float,
+#     maximize: bool,
+#     capturable: bool,
+#     differentiable: bool,
+# ):
+#     assert grad_scale is None and found_inf is None
 
-    for i, param in enumerate(params):
-        grad = grads[i] if not maximize else -grads[i]
-        exp_avg = exp_avgs[i]
-        exp_avg_sq = exp_avg_sqs[i]
-        step_t = state_steps[i]
-        # update step
-        step_t += 1
-        # Decay the first and second moment running average coefficient
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
-        step = _get_value(step_t)
+#     for i, param in enumerate(params):
+#         grad = grads[i] if not maximize else -grads[i]
+#         exp_avg = exp_avgs[i]
+#         exp_avg_sq = exp_avg_sqs[i]
+#         step_t = state_steps[i]
+#         # update step
+#         step_t += 1
+#         # Decay the first and second moment running average coefficient
+#         exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+#         exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+#         step = _get_value(step_t)
 
-        ### pytorch adam implementation:
-        # bias_correction1 = 1 - beta1 ** step
-        # bias_correction2 = 1 - beta2 ** step
-        # step_size = lr / bias_correction1
-        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
-        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-        # param.addcdiv_(exp_avg, denom, value=-step_size)
+#         ### pytorch adam implementation:
+#         # bias_correction1 = 1 - beta1 ** step
+#         # bias_correction2 = 1 - beta2 ** step
+#         # step_size = lr / bias_correction1
+#         # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
+#         # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+#         # param.addcdiv_(exp_avg, denom, value=-step_size)
 
-        ### tensorflow adam implementation:
-        lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
-        denom = exp_avg_sq.sqrt().add_(eps)
-        param.addcdiv_(exp_avg, denom, value=-lr_t)
-
-
-def adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
-    foreach: Optional[bool] = None,
-    capturable: bool = False,
-    differentiable: bool = False,
-    fused: Optional[bool] = None,
-    grad_scale: Optional[Tensor] = None,
-    found_inf: Optional[Tensor] = None,
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-):
-    func = _single_tensor_adam
-
-    func(
-        params,
-        grads,
-        exp_avgs,
-        exp_avg_sqs,
-        max_exp_avg_sqs,
-        state_steps,
-        amsgrad=amsgrad,
-        beta1=beta1,
-        beta2=beta2,
-        lr=lr,
-        weight_decay=weight_decay,
-        eps=eps,
-        maximize=maximize,
-        capturable=capturable,
-        differentiable=differentiable,
-        grad_scale=grad_scale,
-        found_inf=found_inf,
-    )
+#         ### tensorflow adam implementation:
+#         lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
+#         denom = exp_avg_sq.sqrt().add_(eps)
+#         param.addcdiv_(exp_avg, denom, value=-lr_t)
 
 
-class AdamTensorFlowStyle(optim.Adam):
-    @_use_grad_for_differentiable
-    def step(self, closure=None):
-        self._cuda_graph_capture_health_check()
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+# def adam(
+#     params: List[Tensor],
+#     grads: List[Tensor],
+#     exp_avgs: List[Tensor],
+#     exp_avg_sqs: List[Tensor],
+#     max_exp_avg_sqs: List[Tensor],
+#     state_steps: List[Tensor],
+#     # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+#     # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+#     foreach: Optional[bool] = None,
+#     capturable: bool = False,
+#     differentiable: bool = False,
+#     fused: Optional[bool] = None,
+#     grad_scale: Optional[Tensor] = None,
+#     found_inf: Optional[Tensor] = None,
+#     *,
+#     amsgrad: bool,
+#     beta1: float,
+#     beta2: float,
+#     lr: float,
+#     weight_decay: float,
+#     eps: float,
+#     maximize: bool,
+# ):
+#     func = _single_tensor_adam
 
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            state_steps = []
-            beta1, beta2 = group["betas"]
+#     func(
+#         params,
+#         grads,
+#         exp_avgs,
+#         exp_avg_sqs,
+#         max_exp_avg_sqs,
+#         state_steps,
+#         amsgrad=amsgrad,
+#         beta1=beta1,
+#         beta2=beta2,
+#         lr=lr,
+#         weight_decay=weight_decay,
+#         eps=eps,
+#         maximize=maximize,
+#         capturable=capturable,
+#         differentiable=differentiable,
+#         grad_scale=grad_scale,
+#         found_inf=found_inf,
+#     )
 
-            self._init_group(
-                group,
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-            )
 
-            adam(
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-                amsgrad=group["amsgrad"],
-                beta1=beta1,
-                beta2=beta2,
-                lr=group["lr"],
-                weight_decay=group["weight_decay"],
-                eps=group["eps"],
-                maximize=group["maximize"],
-                foreach=group["foreach"],
-                capturable=group["capturable"],
-                differentiable=group["differentiable"],
-                fused=group["fused"],
-                grad_scale=getattr(self, "grad_scale", None),
-                found_inf=getattr(self, "found_inf", None),
-            )
+# class AdamTensorFlowStyle(optim.Adam):
+#     @_use_grad_for_differentiable
+#     def step(self, closure=None):
+#         self._cuda_graph_capture_health_check()
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
 
-        return loss
+#         for group in self.param_groups:
+#             params_with_grad = []
+#             grads = []
+#             exp_avgs = []
+#             exp_avg_sqs = []
+#             max_exp_avg_sqs = []
+#             state_steps = []
+#             beta1, beta2 = group["betas"]
+
+#             self._init_group(
+#                 group,
+#                 params_with_grad,
+#                 grads,
+#                 exp_avgs,
+#                 exp_avg_sqs,
+#                 max_exp_avg_sqs,
+#                 state_steps,
+#             )
+
+#             adam(
+#                 params_with_grad,
+#                 grads,
+#                 exp_avgs,
+#                 exp_avg_sqs,
+#                 max_exp_avg_sqs,
+#                 state_steps,
+#                 amsgrad=group["amsgrad"],
+#                 beta1=beta1,
+#                 beta2=beta2,
+#                 lr=group["lr"],
+#                 weight_decay=group["weight_decay"],
+#                 eps=group["eps"],
+#                 maximize=group["maximize"],
+#                 foreach=group["foreach"],
+#                 capturable=group["capturable"],
+#                 differentiable=group["differentiable"],
+#                 fused=group["fused"],
+#                 grad_scale=getattr(self, "grad_scale", None),
+#                 found_inf=getattr(self, "found_inf", None),
+#             )
+
+#         return loss
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -481,10 +482,10 @@ def train(args: Args):
     # pytorch DDP complains; see https://gist.github.com/vwxyzjn/45fc8706dfb3cf33695f0f57cc44a533
     if isinstance(reward_model.lm_backbone, transformers.GPTNeoXForCausalLM):
         reward_model.lm_backbone.embed_out.requires_grad_(False)
-    if args.use_tensorflow_adam:
-        optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    else:
-        optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    # if args.use_tensorflow_adam:
+    #     optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    # else:
+    optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = load_dataset("bookcorpus", split="train")
     dataset = dataset.shuffle(seed=local_seed)
 
