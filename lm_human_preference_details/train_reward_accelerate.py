@@ -625,6 +625,7 @@ def train(args: Args):
                     predicted_rewards, dim=1
                 )  # shape (batch_size, num_labels), basically a reward prediction for each label
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                # opena 22年RLHF的loss是pair-wise的loss
                 loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
                 accelerator.backward(loss)
                 optimizer.step()  # accelerate handles gradient accumulation automatically

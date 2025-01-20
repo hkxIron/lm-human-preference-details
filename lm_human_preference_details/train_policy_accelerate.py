@@ -728,6 +728,7 @@ def train(args: Args):
             # R(t) = A(st, at) + V(st)
             # returns:[batch, seq_len]
             returns = advantages + critic_values
+
             advantages = whiten(advantages)
             return_mean, return_var = returns.mean(), returns.var()
             value_mean, value_var = critic_values.mean(), critic_values.var()
@@ -771,9 +772,9 @@ def train(args: Args):
 
                         # policy ppo loss
                         logprobs_diff = new_logprobs - mb_logprobs
-                        ratio = torch.exp(logprobs_diff)
-                        pg_losses = -mb_advantage * ratio
-                        pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
+                        importance_sampling_ratio = torch.exp(logprobs_diff)
+                        pg_losses = -mb_advantage * importance_sampling_ratio # PPO 的公式：Pai/Pai(old)*Advantage(st, at)
+                        pg_losses2 = -mb_advantage * torch.clamp(importance_sampling_ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         pg_loss = torch.max(pg_losses, pg_losses2).mean()
 
                         pg_clipfrac = (pg_losses2 > pg_losses).float().mean() # 计算clip的比例
@@ -806,12 +807,12 @@ def train(args: Args):
                         "pg_clipfrac",
                         pg_clipfrac.item(),
                         "ratio",
-                        ratio.mean().item(),
+                        importance_sampling_ratio.mean().item(),
                     )
 
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
-                writer.add_histogram("ppo/val/ratio_hist", ratio, update)
+                writer.add_histogram("ppo/val/ratio_hist", importance_sampling_ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
@@ -843,8 +844,8 @@ def train(args: Args):
             writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
             writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
             writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
-            writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/ratio", accelerator.gather(importance_sampling_ratio.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(importance_sampling_ratio.mean()).var().item(), update)
             writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
             writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
             writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
