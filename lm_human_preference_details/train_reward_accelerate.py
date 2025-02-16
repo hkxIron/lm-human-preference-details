@@ -486,7 +486,9 @@ def train(args: Args):
     #     optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     # else:
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    dataset = load_dataset("bookcorpus", split="train", streaming=False)
+    dataset = load_dataset("bookcorpus", split="train").select(range(1000))
+
+    print("bookcorpus datasets:{dataset}")
     dataset = dataset.shuffle(seed=local_seed)
 
     def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
@@ -569,9 +571,10 @@ def train(args: Args):
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label = load_dataset(
         "vwxyzjn/lm-human-preferences",
-        data_files=[args.label_dataset],
-        streaming=False
-    )["train"]
+        data_files=[args.label_dataset]
+    )["train"].select(range(1000))
+
+    print("label datasets:{label}")
     print("Num labels found in source:", len(label))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 

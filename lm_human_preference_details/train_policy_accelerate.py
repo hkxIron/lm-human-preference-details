@@ -696,7 +696,7 @@ def train(args: Args):
                 gradient_accumulation_idx = 0
                 for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
                     with accelerator.accumulate(policy):
-                        micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+                        micro_batch_end = `micro_batch_start + args.ppo.local_micro_batch_size
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
                         mb_advantage = advantages[micro_batch_inds]
