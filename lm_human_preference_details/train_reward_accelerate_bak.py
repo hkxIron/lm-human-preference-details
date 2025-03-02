@@ -22,6 +22,11 @@ from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
 from torch import Tensor, optim
+# from torch.optim.optimizer import (
+#     _dispatch_sqrt,
+#     _get_value,
+#     _use_grad_for_differentiable,
+# )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -30,8 +35,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 @dataclass
 class LabelHParams:
     type: str = None
-    #num_train: int = 4992
-    num_train: int = 5
+    num_train: int = 4992
     num_labels: int = 4
     source: str = None
 
@@ -72,7 +76,7 @@ class Args:
 
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    #label_dataset: str = "sentiment/offline_5k.json"
+    label_dataset: str = "sentiment/offline_5k.json"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 1
     """per rank batch size"""
@@ -84,7 +88,7 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for Adam"""
-    local_rollout_batch_size: int = 10
+    local_rollout_batch_size: int = 512
     """per rank rollout batch size"""
     rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
@@ -92,7 +96,7 @@ class Args:
     """the number of processes to use"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
-    local_normalize_samples: int = 5
+    local_normalize_samples: int = 256
     """Samples used to estimate reward mean and std"""
     normalize_samples: tyro.conf.Suppress[int] = None
     """Samples used to estimate reward mean and std across all ranks"""
@@ -123,6 +127,155 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
+
+
+# def _single_tensor_adam(
+#     params: List[Tensor],
+#     grads: List[Tensor],
+#     exp_avgs: List[Tensor],
+#     exp_avg_sqs: List[Tensor],
+#     max_exp_avg_sqs: List[Tensor],
+#     state_steps: List[Tensor],
+#     grad_scale: Optional[Tensor],
+#     found_inf: Optional[Tensor],
+#     *,
+#     amsgrad: bool,
+#     beta1: float,
+#     beta2: float,
+#     lr: float,
+#     weight_decay: float,
+#     eps: float,
+#     maximize: bool,
+#     capturable: bool,
+#     differentiable: bool,
+# ):
+#     assert grad_scale is None and found_inf is None
+
+#     for i, param in enumerate(params):
+#         grad = grads[i] if not maximize else -grads[i]
+#         exp_avg = exp_avgs[i]
+#         exp_avg_sq = exp_avg_sqs[i]
+#         step_t = state_steps[i]
+#         # update step
+#         step_t += 1
+#         # Decay the first and second moment running average coefficient
+#         exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+#         exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+#         step = _get_value(step_t)
+
+#         ### pytorch adam implementation:
+#         # bias_correction1 = 1 - beta1 ** step
+#         # bias_correction2 = 1 - beta2 ** step
+#         # step_size = lr / bias_correction1
+#         # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
+#         # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+#         # param.addcdiv_(exp_avg, denom, value=-step_size)
+
+#         ### tensorflow adam implementation:
+#         lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
+#         denom = exp_avg_sq.sqrt().add_(eps)
+#         param.addcdiv_(exp_avg, denom, value=-lr_t)
+
+
+# def adam(
+#     params: List[Tensor],
+#     grads: List[Tensor],
+#     exp_avgs: List[Tensor],
+#     exp_avg_sqs: List[Tensor],
+#     max_exp_avg_sqs: List[Tensor],
+#     state_steps: List[Tensor],
+#     # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+#     # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+#     foreach: Optional[bool] = None,
+#     capturable: bool = False,
+#     differentiable: bool = False,
+#     fused: Optional[bool] = None,
+#     grad_scale: Optional[Tensor] = None,
+#     found_inf: Optional[Tensor] = None,
+#     *,
+#     amsgrad: bool,
+#     beta1: float,
+#     beta2: float,
+#     lr: float,
+#     weight_decay: float,
+#     eps: float,
+#     maximize: bool,
+# ):
+#     func = _single_tensor_adam
+
+#     func(
+#         params,
+#         grads,
+#         exp_avgs,
+#         exp_avg_sqs,
+#         max_exp_avg_sqs,
+#         state_steps,
+#         amsgrad=amsgrad,
+#         beta1=beta1,
+#         beta2=beta2,
+#         lr=lr,
+#         weight_decay=weight_decay,
+#         eps=eps,
+#         maximize=maximize,
+#         capturable=capturable,
+#         differentiable=differentiable,
+#         grad_scale=grad_scale,
+#         found_inf=found_inf,
+#     )
+
+
+# class AdamTensorFlowStyle(optim.Adam):
+#     @_use_grad_for_differentiable
+#     def step(self, closure=None):
+#         self._cuda_graph_capture_health_check()
+#         loss = None
+#         if closure is not None:
+#             with torch.enable_grad():
+#                 loss = closure()
+
+#         for group in self.param_groups:
+#             params_with_grad = []
+#             grads = []
+#             exp_avgs = []
+#             exp_avg_sqs = []
+#             max_exp_avg_sqs = []
+#             state_steps = []
+#             beta1, beta2 = group["betas"]
+
+#             self._init_group(
+#                 group,
+#                 params_with_grad,
+#                 grads,
+#                 exp_avgs,
+#                 exp_avg_sqs,
+#                 max_exp_avg_sqs,
+#                 state_steps,
+#             )
+
+#             adam(
+#                 params_with_grad,
+#                 grads,
+#                 exp_avgs,
+#                 exp_avg_sqs,
+#                 max_exp_avg_sqs,
+#                 state_steps,
+#                 amsgrad=group["amsgrad"],
+#                 beta1=beta1,
+#                 beta2=beta2,
+#                 lr=group["lr"],
+#                 weight_decay=group["weight_decay"],
+#                 eps=group["eps"],
+#                 maximize=group["maximize"],
+#                 foreach=group["foreach"],
+#                 capturable=group["capturable"],
+#                 differentiable=group["differentiable"],
+#                 fused=group["fused"],
+#                 grad_scale=getattr(self, "grad_scale", None),
+#                 found_inf=getattr(self, "found_inf", None),
+#             )
+
+#         return loss
+
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.normal_(layer.weight, std=std)
@@ -262,7 +415,7 @@ def normalize(
         mean, std = rewards.mean(), rewards.std()
         print(f"after mean: {mean}, after std: {std}")
 
-def process_query_data_of_bookcorpus(x, base_model: str, response_length: int):  # added args so it's hashable
+def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     # tokenizer.__call__会返回input_ids,attention_mask, label_ids
@@ -271,26 +424,6 @@ def process_query_data_of_bookcorpus(x, base_model: str, response_length: int): 
             x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
         )["input_ids"],
     }
-
-"""
-{
-    "query": "中国哪个城市最适合年轻人工作",
-    "sample0": "这主要取决于个人的职业规划、生活习惯和追求。不过，总的来说，以下几个城市可能是年轻人比较青睐的工作地方：北京：中国的政治、文化中心，聚集了大量的优质教育和医疗资源，是大多数国内外知名企业的总部所在地，尤其对媒体、互联网和金融等行业的人士来说，职业发展机会广阔。上海：中国的经济中心，有众多的外资企业和金融机构，对金融、贸易、广告设计等行业的发展非常有利。此外，上海的国际化程度很高，是不错的国际性职业发展平台。深圳：作为中国的科技创新中心，深圳现在是全国最年轻的一线城市，拥有大量科技创新型公司，如华为、腾讯等，对科技、互联网行业的人才需求非常大。杭州：阿里巴巴的总部所在地，吸引了大量电子商务、互联网及创新创业人才。成都：近些年成为西部地区的经济中心，且生活节奏相对较慢，生活成本较低，适合追求生活品质的年轻人。广州：靠近港澳，与东南亚的经济联系紧密，有众多的贸易、物流企业，对商务、物流、进出口等行业的发展有着良好环境。这只是一个大致的参考，具体还要根据个人的实际情况来选择。",
-    "sample1": "中国有很多城市都适合年轻人工作，这取决于个人的专业背景、职业目标、生活偏好以及对未来的规划。下面是一些通常被认为适合年轻人工作的城市：一线城市（北上广深）：北京：作为中国的首都，是政治、文化和教育中心，提供了丰富的就业机会，尤其是在科技、媒体和金融行业。上海：国际化大都市，拥有发达的金融服务和跨国公司，非常适合有志于国际商务、金融和技术的年轻人。广州：商业氛围浓厚，贸易活动频繁，适合从事外贸、电商等领域。深圳：被称为“创业之都”，是中国科技创新的重要发源地之一，对于希望在互联网、硬件制造和其他高科技领域发展的年轻人来说非常有吸引力。二线城市：杭州：以阿里巴巴等互联网巨头著称，电子商务和金融科技行业发展迅速，同时生活质量高，环境优美。成都：拥有悠闲的生活节奏和平民文化，同时也在快速发展信息技术和生物技术产业。西安：历史文化底蕴深厚，近年来在高新技术产业方面也有所发展，特别是航空航天、新材料等领域。南京：教育科研资源丰富，软件和服务外包产业发展良好。其他潜力城市：随着政策的支持和其他二线或三线城市的崛起，如天津、重庆、武汉、苏州等地也为年轻人提供了良好的发展机遇。选择哪个城市最适合你，还需要考虑个人的兴趣、技能匹配度、职业发展路径以及生活的成本等因素。如果你倾向于快速成长并在竞争激烈的环境中磨练自己，那么一线或新兴的二线城市可能更适合；如果你更看重生活品质和相对轻松的工作氛围，一些二线城市或许会是更好的选择。",
-    "sample2": "在中国，对于年轻人来说，有几个城市因其经济发展、就业机会、生活质量和未来发展潜力而被认为是非常适合工作的。以下是几个常被提及的城市以及它们各自的优势：深圳：根据个人经历和讨论，深圳被誉为最适合创业和打拼的城市之一。它以开放和包容著称，吸引了很多有志之士前来寻求发展机遇。深圳有着良好的创业环境，且经济活跃，提供了丰富的就业机会。杭州：作为中国互联网行业的中心之一，杭州拥有众多高科技企业和创业公司。它的薪酬水平较高，并且城市除了保留历史人文风貌之外，也充满了活力和创新精神，适合寻求互联网和科技领域工作机会的年轻人。成都：成都以其休闲的生活方式和活跃的文化氛围而闻名。它同样也是一个充满创业精神的城市，吸引了许多创业者。成都在餐饮、娱乐、旅游等行业有着显著优势，适合希望在这些领域寻找机会的年轻人。西安：西安虽然在某种程度上被认为是更看重人际关系而非纯粹能力的地方，但它依然是一个重要的文化和教育资源中心。西安可能更适合那些希望在文化和教育行业寻求发展机会的年轻人。选择适合的工作城市还需要考虑个人的兴趣、专业背景以及职业规划等因素。每个城市都有其特点和优势，选择最适合自己发展的城市非常重要。",
-    "sample3": "中国最适合年轻人工作的城市通常包括北京、上海、深圳、杭州等。这些城市经济发达，就业机会多，创新氛围浓厚，生活设施完善，有利于年轻人职业发展和生活品质提升。",
-    "best": 1
-}
-"""
-def process_data_of_human_preference(x, base_model: str, response_length: int):  # added args so it's hashable
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    # tokenizer.__call__会返回input_ids,attention_mask, label_ids
-    return dict([
-        (key, tokenizer(
-            value, padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
-        )["input_ids"] if key!='best' else value) for (key, value) in x.items()
-    ])
 
 def train(args: Args):
     accelerator = Accelerator(
@@ -313,6 +446,7 @@ def train(args: Args):
     if accelerator.is_main_process:
         if args.track:
             import wandb
+
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -360,16 +494,18 @@ def train(args: Args):
     #     optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     # else:
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    bookcorpus_dataset = load_dataset("json", data_files="./data/bookcorpus/*.jsonl")['train'] #.select(range(1000))
+    dataset = load_dataset("bookcorpus", split="train").select(range(1000))
 
-    print(f"bookcorpus datasets:{bookcorpus_dataset}")
-    bookcorpus_dataset = bookcorpus_dataset.shuffle(seed=local_seed)
+    print("bookcorpus datasets:{dataset}")
+    dataset = dataset.shuffle(seed=local_seed)
 
-    bookcorpus_dataset.set_transform(functools.partial(process_query_data_of_bookcorpus, base_model=args.base_model, response_length=args.task.response_length))
+    dataset.set_transform(
+        functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
+    )
 
     # torch.dataloader
-    bookcorpus_dataloader = DataLoader(bookcorpus_dataset, batch_size=args.local_rollout_batch_size)
-    reward_model, optimizer, bookcorpus_dataloader = accelerator.prepare(reward_model, optimizer, bookcorpus_dataloader)
+    dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
+    reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)
 
     if args.deepspeed:
         import deepspeed
@@ -398,9 +534,9 @@ def train(args: Args):
 
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
-            yield from bookcorpus_dataloader # 一直从dataloader中产生数据
+            yield from dataloader # 一直从dataloader中产生数据
 
-    iter_dataloader_bookcorpus = iter(repeat_generator())
+    iter_dataloader = iter(repeat_generator())
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
@@ -424,7 +560,7 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_dataloader_bookcorpus,
+            iter_dataloader,
             generation_config,
             tokenizer,
         )
@@ -436,13 +572,11 @@ def train(args: Args):
 
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label_dataset = load_dataset(
-        path="json",
-        data_files="./data/lm-human-preferences/*.jsonl",
-        #data_files=[args.label_dataset]
-    )["train"] #.select(range(1000))
-    label_dataset.set_transform(functools.partial(process_data_of_human_preference, base_model=args.base_model, response_length=args.task.response_length))
+        "vwxyzjn/lm-human-preferences",
+        data_files=[args.label_dataset]
+    )["train"].select(range(1000))
 
-    print(f"label datasets:{label_dataset}")
+    print("label datasets:{label}")
     print("Num labels found in source:", len(label_dataset))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
@@ -465,10 +599,9 @@ def train(args: Args):
         accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
         gradient_accumulation_step = 0
         for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
-            with accelerator.accumulate(reward_model): # 梯度累积
+            with accelerator.accumulate(reward_model):
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
-
                 mb_data = label_dataset[micro_batch_inds]
                 mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
@@ -486,8 +619,9 @@ def train(args: Args):
                     query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(reward.view(-1))
-
-                predicted_rewards = torch.stack( predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
+                predicted_rewards = torch.stack(
+                    predicted_rewards, dim=1
+                )  # shape (batch_size, num_labels), basically a reward prediction for each label
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                 loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
                 accelerator.backward(loss)
@@ -542,7 +676,7 @@ def train(args: Args):
                     print("test/accuracy", test_accuracy, global_step)
 
                 # the part below is testing out some generations and KLs, not presented in the original code
-                data = next(iter_dataloader_bookcorpus)
+                data = next(iter_dataloader)
                 queries = data["query_token"].to(device)
                 context_length = queries.shape[1]
                 queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
@@ -610,7 +744,7 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_dataloader_bookcorpus,
+            iter_dataloader,
             generation_config,
             tokenizer,
         )

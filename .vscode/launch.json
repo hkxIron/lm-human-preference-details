@@ -1,0 +1,26 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    // 其实运行的是下面这个python命令
+    // cd /home/hkx/data/work/open/lm-human-preference-details ; /usr/bin/env /home/hkx/miniforge3/envs/rlhf/bin/python /home/hkx/.vscode-server/extensions/ms-python.debugpy-2024.14.0/bundled/libs/debugpy/adapter/../../debugpy/launcher 42333 -- -m accelerate.commands.launch --num_processes 1 ./lm_human_preference_details/train_reward_accelerate.py --track
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "train_reward_accelerate.py",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",          //调试accelerate launch,如果是python就不用
+            "console": "integratedTerminal",
+            "args":[ 
+                "--num_processes", "1",
+                "./lm_human_preference_details/train_reward_accelerate.py",
+                "--base_model", "/home/hkx/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
+                "--no-cuda",
+                "--no-track"
+                //"--cuda", 
+                //"--track" // 会启用wandb
+            ]
+        }
+    ]
+}
