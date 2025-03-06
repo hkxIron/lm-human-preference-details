@@ -171,7 +171,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 #tokens:Annotated[torch.Tensor, Shape["batch,seq_len"]], 
 #tokens: TensorType["batch", "seq_len", int],
 def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
-                                  pad_id:int):
+                                  pad_id:int) -> TensorType["batch", "seq_len", int]:
     """Convert from right padding to left padding."""
     # 将right padding转为left padding
     # tokens:[batch, seq_len]
