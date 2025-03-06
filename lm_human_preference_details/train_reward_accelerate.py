@@ -4,7 +4,11 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Iterable, List, Optional, Tuple
+#from nptyping import NDArray, Shape, Int
+from typing import Annotated
+from torchtyping import TensorType
+
 
 import numpy as np
 import pandas as pd
@@ -25,13 +29,16 @@ from torch import Tensor, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 @dataclass
 class LabelHParams:
     type: str = None
     #num_train: int = 4992
-    num_train: int = 5
+    num_train: int = 300 
     num_labels: int = 4
     source: str = None
 
@@ -78,22 +85,28 @@ class Args:
     """per rank batch size"""
     gradient_accumulation_steps: int = 1
     """gradient accumulation steps"""
+
     local_micro_batch_size: tyro.conf.Suppress[int] = None
     """per rank micro batch size"""
+
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for Adam"""
-    local_rollout_batch_size: int = 10
+
+    local_rollout_batch_size: int = 3
     """per rank rollout batch size"""
+
     rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
+
     local_normalize_samples: int = 5
     """Samples used to estimate reward mean and std"""
+
     normalize_samples: tyro.conf.Suppress[int] = None
     """Samples used to estimate reward mean and std across all ranks"""
     debug_normalize: int = 0
@@ -131,7 +144,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class AutoModelForCausalLMWithRewardHead(nn.Module):
-    def __init__(self, lm_backbone):
+    def __init__(self, lm_backbone:AutoModelForCausalLM):
         super().__init__()
         self.lm_backbone = lm_backbone
         # 注意：在这里加了一个打分的头, [hidden_size, 1]
@@ -142,7 +155,8 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
-    def forward(self, **kwargs):
+    # 返回lm的output以及reward打分
+    def forward(self, **kwargs)->Tuple[Tensor, Tensor]:
         output = self.lm_backbone(**kwargs)
         reward_latents = output.hidden_states[-1]
         # shape: [batch_size, length, hidden_size]
@@ -154,9 +168,13 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         return output, reward
 
 
-def right_padding_to_left_padding(tokens:List[int], pad_id:int):
+#tokens:Annotated[torch.Tensor, Shape["batch,seq_len"]], 
+#tokens: TensorType["batch", "seq_len", int],
+def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
+                                  pad_id:int):
     """Convert from right padding to left padding."""
     # 将right padding转为left padding
+    # tokens:[batch, seq_len]
     assert tokens.ndim == 2
     return torch.tensor(
         [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
@@ -175,10 +193,13 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone, queries, tokenizer, generation_config):
+def generate(lm_backbone:AutoModelForCausalLM, queries:Tensor, tokenizer:AutoTokenizer, generation_config:GenerationConfig):
     """generate in a way that does not affect padding tokens"""
+    # queries:[batch, seq_len]
     context_length = queries.shape[1]
-    attention_mask = queries != tokenizer.pad_token_id
+    attention_mask = queries != tokenizer.pad_token_id # 左padding
+    # 可能是为了适配？将tokenizer_pad_id填充为0
+    # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     output = lm_backbone.generate(
         input_ids=input_ids,
@@ -187,14 +208,41 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
-    # restore padding tokens
+    # queries:[batch, seq_len=24]
+    # output.sequences:[batch, gen_seq_len=48]
+    # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,因为input_ids中的对query里的pad_id替换为0了
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model, query_responses, tokenizer):
+def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, query_responses:Tensor, tokenizer:AutoTokenizer)->Tuple[Tensor, Tensor]:
     attention_mask = query_responses != tokenizer.pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
+    # 此处又显式计算了position_ids
+    position_ids = attention_mask.cumsum(axis=1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    """
+    position_ids=tensor([[ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  6,  7,
+          8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+         26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37],
+         ...
+    attention_mask=tensor([[False, False, False, False, False, False, False, False, False, False,
+          True,  True,  True,  True,  True,  True,  True,  True,  True,  True,
+          True,  True,  True,  True,  True,  True,  True,  True,  True,  True,
+          True,  True,  True,  True,  True,  True,  True,  True,  True,  True,
+          True,  True,  True,  True,  True,  True,  True,  True],
+          ...
+    input_ids=tensor([[    0,     0,     0,     0,     0,     0,     0,     0,     0,     0,
+          3983,   358, 30107,   678,   847,  2272,   369,  1045,   775,  9603,
+             6,   323,  1045,  6623,    13,   220,    17,    20,  1635,  4134,
+            11,   358,   572,   264,  3908,  3743,   448,   264,  7904,    13,
+           358,  1030,   264,  7904,    11,   264,  7904,   311],
+           ...
+    从上面的例子可以看出，如果mask=0,那么position_ids是从mask=1处开始计算的，而不是0处，所以即使padding也不会影响最后计算的正确性
+    """
+    print(f"\n{position_ids=}")
+    print(f"{attention_mask=}")
+    print(f"{input_ids=}")
+    # 返回lm的output以及reward打分
     return reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -208,14 +256,14 @@ def normalize(
     args,
     accelerator,
     device,
-    lm_backbone,
-    reward_model,
-    iter_dataloader,
-    generation_config,
-    tokenizer,
+    lm_backbone:AutoModelForCausalLM,
+    reward_model:AutoModelForCausalLMWithRewardHead,
+    iter_dataloader:Iterable[DataLoader],
+    generation_config:GenerationConfig,
+    tokenizer:AutoTokenizer,
 ):
     with torch.no_grad():
-        # reset reward scales
+        # reset reward scales, 将model的gain, bias重置
         accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
         # number of minibatches for computing the normalization statistics
@@ -304,6 +352,7 @@ def train(args: Args):
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
     args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
+    # local_batch_size一定要能被gradient_accumulation_steps整除, 生成微批次 micro-batch
     args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
     console = Console(force_terminal=True)
@@ -330,10 +379,12 @@ def train(args: Args):
         pprint(args)
     device = accelerator.device
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
+
     random.seed(local_seed)
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
@@ -341,6 +392,7 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    #model.resize_token_embeddings(len(tokenizer))
     untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     # 禁用eos, pad token
@@ -356,13 +408,17 @@ def train(args: Args):
     # pytorch DDP complains; see https://gist.github.com/vwxyzjn/45fc8706dfb3cf33695f0f57cc44a533
     if isinstance(reward_model.lm_backbone, transformers.GPTNeoXForCausalLM):
         reward_model.lm_backbone.embed_out.requires_grad_(False)
+
     # if args.use_tensorflow_adam:
     #     optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     # else:
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    bookcorpus_dataset = load_dataset("json", data_files="./data/bookcorpus/*.jsonl")['train'] #.select(range(1000))
+    bookcorpus_dataset = load_dataset("json", data_files={
+        "train":"./data/bookcorpus/*.jsonl",
+        "test":["./data/bookcorpus/sample2.jsonl", "./data/bookcorpus/sample3.jsonl"]})['train'] #.select(range(1000))
 
     print(f"bookcorpus datasets:{bookcorpus_dataset}")
+    print(f"some examples:{bookcorpus_dataset[0:3]=}")
     bookcorpus_dataset = bookcorpus_dataset.shuffle(seed=local_seed)
 
     bookcorpus_dataset.set_transform(functools.partial(process_query_data_of_bookcorpus, base_model=args.base_model, response_length=args.task.response_length))
@@ -375,10 +431,11 @@ def train(args: Args):
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        #deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
         # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
+            "train_micro_batch_size_per_gpu": 1,
+            #"train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             # "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
@@ -391,6 +448,7 @@ def train(args: Args):
             "prescale_gradients": False,
             "wall_clock_breakdown": False,
         }
+        # 注意：此处只对eval model启用deepspeed推理
         untrained_model, *_ = deepspeed.initialize(model=untrained_model, config=eval_ds_config)
         untrained_model.eval()
     else:
@@ -402,9 +460,9 @@ def train(args: Args):
 
     iter_dataloader_bookcorpus = iter(repeat_generator())
     generation_config = GenerationConfig(
-        max_new_tokens=args.task.response_length,
-        min_new_tokens=args.task.response_length,
-        temperature=args.task.temperature,
+        max_new_tokens=args.task.response_length, # 24
+        min_new_tokens=args.task.response_length, # 24
+        temperature=args.task.temperature, # 0.7
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -414,7 +472,7 @@ def train(args: Args):
         print("===Normalize reward model *before* training===")
         print(
             "before normalization. "
-            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
             + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
@@ -449,10 +507,12 @@ def train(args: Args):
     print("===training reward model===")
     all_inds = np.random.permutation(args.labels.num_train)
     # ensure that all processes have the same shuffled indices
-    all_inds = broadcast(torch.tensor(all_inds, device=device), 0)
+    # 从主process广播到其它process
+    all_inds = broadcast(torch.tensor(all_inds, device=device), from_process=0)
     all_inds = all_inds.cpu().numpy()
     global_step = 0
-    for start in range(0, args.labels.num_train, args.batch_size):
+    # 从中随机选取一个batch
+    for start in range(0, args.labels.num_train, args.batch_size): # 每隔batch_size步，生成一个begin_index
         # linear rate annealing
         lr = (1 - start / args.labels.num_train) * args.lr
         optimizer.param_groups[0]["lr"] = lr
@@ -460,7 +520,9 @@ def train(args: Args):
         global_step += 1
         end = start + args.batch_size
         b_inds_all = all_inds[start:end]
+        # x[process_index=1::num_process=3], 即从process_index开始取样，每隔num_process采样一条样本
         b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
+        # 梯度累加
         losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
         accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
         gradient_accumulation_step = 0

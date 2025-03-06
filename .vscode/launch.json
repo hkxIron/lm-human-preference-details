@@ -16,6 +16,9 @@
                 "--num_processes", "1",
                 "./lm_human_preference_details/train_reward_accelerate.py",
                 "--base_model", "/home/hkx/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
+                "--save_path","models/reward",
+                "--deepspeed",
+                //"--deepspeed", // 禁用deepspeed
                 "--no-cuda",
                 "--no-track"
                 //"--cuda", 
