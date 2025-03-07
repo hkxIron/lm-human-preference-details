@@ -7,22 +7,41 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "train_reward_accelerate.py",
+            "name": "训练reward模型",
             "type": "debugpy",
             "request": "launch",
             "module": "accelerate.commands.launch",          //调试accelerate launch,如果是python就不用
             "console": "integratedTerminal",
             "args":[ 
-                "--num_processes", "1",
+                "--num_processes", "2",
                 "./lm_human_preference_details/train_reward_accelerate.py",
-                "--base_model", "/home/hkx/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
+                "--base_model", "${env:HOME}/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
                 "--save_path","models/reward",
                 "--deepspeed",
                 //"--deepspeed", // 禁用deepspeed
                 "--no-cuda",
-                "--no-track"
+                "--no-track",
+                "--task.temperature", "0.65",
                 //"--cuda", 
                 //"--track" // 会启用wandb
+            ]
+        },
+        {
+            "name": "训练policy模型",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",          //调试accelerate launch,如果是python就不用
+            "console": "integratedTerminal",
+            "args":[ 
+                "--num_processes", "2",
+                "./lm_human_preference_details/train_policy_accelerate.py",
+                "--base_model", "${env:HOME}/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
+                "--save_path","models/policy",
+                "--rewards.trained_model","models/reward/pytorch.bin", // reward模型
+                //"--deepspeed", // 禁用deepspeed
+                "--no-cuda",
+                "--no-track",
+                "--task.temperature", "0.65",
             ]
         }
     ]

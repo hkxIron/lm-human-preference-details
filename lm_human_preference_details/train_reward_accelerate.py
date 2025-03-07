@@ -1,10 +1,14 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+#warnings.filterwarnings("ignore", category=UserWarning)
 import functools
 import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 #from nptyping import NDArray, Shape, Int
 from typing import Annotated
 from torchtyping import TensorType
@@ -17,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import transformers
+from transformers.modeling_outputs import CausalLMOutputWithPast
 import tyro
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
@@ -29,9 +34,7 @@ from torch import Tensor, optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
+#pip install typeguard==4.4.1
 
 
 @dataclass
@@ -47,30 +50,45 @@ class LabelHParams:
 class TaskHParams:
     # Query params
     query_length: int = 64
+
     query_dataset: str = "books"
 
     # Response params
     response_length: int = 24
 
     # LM params
-    temperature: float = 0.7
+    temperature: float = 0.7 # 温度越小越确定
 
 
+"""
+@dataclass 是 Python 中的一个装饰器（Decorator），用于简化类的定义，特别是那些主要用于存储数据的类。它的作用是为类自动生成一些常用的方法（如 __init__、__repr__、__eq__ 等），从而减少样板代码。
+__init__
+params = AdaptiveKLParams(target=5.0, horizon=20000)
+__repr__
+print(params)
+# 输出：AdaptiveKLParams(target=5.0, horizon=20000)
+"""
 @dataclass
 class Args:
     # common args
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+
     seed: int = 1
     """seed of the experiment"""
+
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
+
     wandb_project_name: str = "cleanrl"
     """the wandb's project name"""
+
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
+    
     cuda: bool = True
     """Whether to use cuda if available."""
+
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
 
@@ -79,11 +97,14 @@ class Args:
 
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
+
     #label_dataset: str = "sentiment/offline_5k.json"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
-    local_batch_size: int = 1
+
+    local_batch_size: int = 6
     """per rank batch size"""
-    gradient_accumulation_steps: int = 1
+
+    gradient_accumulation_steps: int = 2
     """gradient accumulation steps"""
 
     local_micro_batch_size: tyro.conf.Suppress[int] = None
@@ -91,6 +112,7 @@ class Args:
 
     lr: float = 0.00005
     """the learning rate"""
+
     eps: float = 1e-5
     """the epsilon for Adam"""
 
@@ -99,8 +121,10 @@ class Args:
 
     rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
+
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
+
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
 
@@ -109,19 +133,27 @@ class Args:
 
     normalize_samples: tyro.conf.Suppress[int] = None
     """Samples used to estimate reward mean and std across all ranks"""
+
     debug_normalize: int = 0
     """Samples used to check that normalization worked"""
+
     normalize_before: bool = True
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
+
     normalize_after: bool = True
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
+
     print_sample_output_freq: int = 10
     """How often to print sample output"""
+
     save_path: str = "models/reward"
     """Where to save the model"""
+
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
+
     task: TaskHParams = field(default_factory=TaskHParams)
+
     labels: LabelHParams = field(default_factory=LabelHParams)
 
 
@@ -134,7 +166,7 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_column(column)
     for _, row in df.iterrows():
         table.add_row(*row.astype(str).tolist())
-    console.rule(f"[bold red]{title}")
+    console.rule(f"[bold red]{title}") # 用于标题行
     console.print(table)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -146,21 +178,21 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone:AutoModelForCausalLM):
         super().__init__()
-        self.lm_backbone = lm_backbone
+        self.lm_backbone: AutoModelForCausalLM = lm_backbone
         # 注意：在这里加了一个打分的头, [hidden_size, 1]
         self.scalar_head = layer_init(
             nn.Linear(lm_backbone.config.hidden_size, 1),
             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
         )
-        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True) # scale
+        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True) # bias
 
     # 返回lm的output以及reward打分
-    def forward(self, **kwargs)->Tuple[Tensor, Tensor]:
+    def forward(self, **kwargs)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
         output = self.lm_backbone(**kwargs)
         reward_latents = output.hidden_states[-1]
         # shape: [batch_size, length, hidden_size]
-        last_reward_latents = reward_latents[:, -1, :]
+        last_reward_latents = reward_latents[:, -1, :] # 只取seq最后一个token的hidden_state
         # shape: [batch_size, hidden_size]
         reward = self.scalar_head(last_reward_latents)
         # shape: [batch_size, 1]
@@ -193,8 +225,11 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone:AutoModelForCausalLM, queries:Tensor, tokenizer:AutoTokenizer, generation_config:GenerationConfig):
+def generate(lm_backbone:AutoModelForCausalLM, 
+             queries:TensorType["batch", "seq_len", int], 
+             tokenizer:AutoTokenizer, generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
     """generate in a way that does not affect padding tokens"""
+    # 不影响padding token
     # queries:[batch, seq_len]
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id # 左padding
@@ -210,11 +245,14 @@ def generate(lm_backbone:AutoModelForCausalLM, queries:Tensor, tokenizer:AutoTok
     )
     # queries:[batch, seq_len=24]
     # output.sequences:[batch, gen_seq_len=48]
-    # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,因为input_ids中的对query里的pad_id替换为0了
+    # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,
+    # 之所以需要拼接，是因为从queryies中复制的input_ids中的对query里的pad_id替换为0了与原始queries中的pad_id不同
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, query_responses:Tensor, tokenizer:AutoTokenizer)->Tuple[Tensor, Tensor]:
+def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
+               query_responses:TensorType["batch", "seq_len", int], 
+               tokenizer:AutoTokenizer)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
     # 此处又显式计算了position_ids
@@ -239,9 +277,9 @@ def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, query_responses:
            ...
     从上面的例子可以看出，如果mask=0,那么position_ids是从mask=1处开始计算的，而不是0处，所以即使padding也不会影响最后计算的正确性
     """
-    print(f"\n{position_ids=}")
-    print(f"{attention_mask=}")
-    print(f"{input_ids=}")
+    #print(f"\n{position_ids=}")
+    #print(f"{attention_mask=}")
+    #print(f"{input_ids=}")
     # 返回lm的output以及reward打分
     return reward_model(
         input_ids=input_ids,
@@ -252,7 +290,7 @@ def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, query_responses:
     )
 
 
-def normalize(
+def reward_normalize(
     args,
     accelerator,
     device,
@@ -290,7 +328,7 @@ def normalize(
         gain = target_std / std
         bias = target_mean - gain * mean
         print(f"gain: {gain}, bias: {bias}")
-        accelerator.unwrap_model(reward_model).reward_gain.data = gain
+        accelerator.unwrap_model(reward_model).reward_gain.data = gain # 直接改变tensor原始的值
         accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
@@ -309,6 +347,11 @@ def normalize(
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
         print(f"after mean: {mean}, after std: {std}")
+        """
+        mean: -2.7686221599578857, std: 3.473921775817871
+        gain: 0.28785911202430725, bias: 0.7969731092453003
+        after mean: 0.10747156292200089, after std: 1.453482747077942
+        """
 
 def process_query_data_of_bookcorpus(x, base_model: str, response_length: int):  # added args so it's hashable
     tokenizer = AutoTokenizer.from_pretrained(base_model)
@@ -330,7 +373,7 @@ def process_query_data_of_bookcorpus(x, base_model: str, response_length: int): 
     "best": 1
 }
 """
-def process_data_of_human_preference(x, base_model: str, response_length: int):  # added args so it's hashable
+def process_data_of_human_preference(x:Dict, base_model: str, response_length: int):  # added args so it's hashable
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     # tokenizer.__call__会返回input_ids,attention_mask, label_ids
@@ -359,7 +402,7 @@ def train(args: Args):
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
-    if accelerator.is_main_process:
+    if accelerator.is_main_process: # 即只有主进程才使用tensorboard
         if args.track:
             import wandb
             wandb.init(
@@ -393,13 +436,13 @@ def train(args: Args):
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     #model.resize_token_embeddings(len(tokenizer))
-    untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    reference_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     # 禁用eos, pad token
-    untrained_model.lm_backbone.generation_config.eos_token_id = (
+    reference_model.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
-    untrained_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    reference_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     reward_model.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -433,7 +476,7 @@ def train(args: Args):
         deepspeed_states = AcceleratorState().deepspeed_plugin
         #deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
         # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
-        eval_ds_config = {
+        eval_deepspeed_config = {
             "train_micro_batch_size_per_gpu": 1,
             #"train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             # "steps_per_print": 10,
@@ -449,16 +492,17 @@ def train(args: Args):
             "wall_clock_breakdown": False,
         }
         # 注意：此处只对eval model启用deepspeed推理
-        untrained_model, *_ = deepspeed.initialize(model=untrained_model, config=eval_ds_config)
-        untrained_model.eval()
+        reference_model, *_ = deepspeed.initialize(model=reference_model, config=eval_deepspeed_config)
     else:
-        untrained_model = untrained_model.to(device)
+        reference_model = reference_model.to(device)
+    reference_model.eval()
 
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
             yield from bookcorpus_dataloader # 一直从dataloader中产生数据
 
-    iter_dataloader_bookcorpus = iter(repeat_generator())
+
+    iter_dataloader_bookcorpus_lm = iter(repeat_generator())
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length, # 24
         min_new_tokens=args.task.response_length, # 24
@@ -476,13 +520,13 @@ def train(args: Args):
             + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
-        normalize(
+        reward_normalize(
             args,
             accelerator,
             device,
-            untrained_model.lm_backbone,
+            reference_model.lm_backbone,
             reward_model,
-            iter_dataloader_bookcorpus,
+            iter_dataloader_bookcorpus_lm,
             generation_config,
             tokenizer,
         )
@@ -507,34 +551,39 @@ def train(args: Args):
     print("===training reward model===")
     all_inds = np.random.permutation(args.labels.num_train)
     # ensure that all processes have the same shuffled indices
-    # 从主process广播到其它process
+    # all_inds从主process广播到其它process
     all_inds = broadcast(torch.tensor(all_inds, device=device), from_process=0)
     all_inds = all_inds.cpu().numpy()
     global_step = 0
     # 从中随机选取一个batch
     for start in range(0, args.labels.num_train, args.batch_size): # 每隔batch_size步，生成一个begin_index
         # linear rate annealing
-        lr = (1 - start / args.labels.num_train) * args.lr
+        lr = (1 - start / args.labels.num_train) * args.lr # 学习率随时间减少
         optimizer.param_groups[0]["lr"] = lr
 
         global_step += 1
         end = start + args.batch_size
         b_inds_all = all_inds[start:end]
+        # 将一个batch平均分给多个process
         # x[process_index=1::num_process=3], 即从process_index开始取样，每隔num_process采样一条样本
+        # accelerator.num_processes; 表示当前分布式训练中使用的总进程数,在数据并行训练中，num_processes 通常等于 GPU 的数量。
+        print(f"{accelerator.process_index=} {accelerator.num_processes=}")
         b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
-        # 梯度累加
+        # 梯度累加, 每次只取local_micro_batch_size个样本进行训练
         losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
         accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
         gradient_accumulation_step = 0
         for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
-            with accelerator.accumulate(reward_model): # 梯度累积
+            with accelerator.accumulate(reward_model): # 梯度累积context, 会禁止反向传播时梯度自动同步
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
 
-                mb_data = label_dataset[micro_batch_inds]
+                # `label_dataset` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
+                mb_data = label_dataset[micro_batch_inds] # batch大小 local_micro_batch_size
                 mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-                mb_responses = [
+                # 共用4个label,分别为sample0,sample1,sample2,sample3
+                mb_responses:List[TensorType['seq_len', int]] = [
                     torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
                 ]
                 # hack: deal with openai's padding token
@@ -544,25 +593,30 @@ def train(args: Args):
 
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
-                    query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                    query_responses :TensorType['batch=1','seq_len', int]= torch.cat([mb_query, mb_responses[i]], dim=1)
                     query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(reward.view(-1))
 
-                predicted_rewards = torch.stack( predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
+                # 从4个答案中直接预测哪个最好，而不是RLHF中的pairwise两两一组判断进行二分类
+                # predicted_rewards:[batch, num_labels=4], float
+                predicted_rewards:TensorType["batch", "num_labels=4", float] = torch.stack( predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
+                # mb_best:[batch], int
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                # loss:[batch], float
                 loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
-                accelerator.backward(loss)
+                accelerator.backward(loss) # 此处在每个micro_batch里就调用用optimizer更新了梯度，此处grad_accumulation貌似并没有生效？
                 optimizer.step()  # accelerate handles gradient accumulation automatically
                 optimizer.zero_grad()
                 losses[gradient_accumulation_step] = loss
                 accuracies[gradient_accumulation_step] = accuracy
             gradient_accumulation_step += 1
 
-        writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
+        writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step) # 计算accumulate loss
         writer.add_scalar("train/accuracy", accelerator.gather(accuracies).mean().item(), global_step)
         writer.add_scalar("train/lr", lr, global_step)
 
+        # 每隔print_sample_output_freq个step打印一下log
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
@@ -578,7 +632,7 @@ def train(args: Args):
                         micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                         mb_data = label_dataset[micro_batch_inds]
                         mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                        mb_query = right_padding_to_left_padding(mb_query, tokenizer.pad_token_id).to(device)
+                        mb_query = right_padding_to_left_padding(mb_query, tokenizer.pad_token_id).to(device) # 此处为何不等query与response拼接后再padding
                         mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                         mb_responses = [
                             torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
@@ -587,56 +641,66 @@ def train(args: Args):
                         mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
                         for item in mb_responses:
                             item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+
                         predicted_rewards = []
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
                             query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
                             reward = get_reward(reward_model, query_responses, tokenizer)[1]
                             predicted_rewards.append(reward.view(-1))
-                        predicted_rewards = torch.stack(
-                            predicted_rewards, dim=1
-                        )  # shape (batch_size, num_labels), basically a reward prediction for each label
+
+                        predicted_rewards = torch.stack(predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
                         accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                         test_accuracies.append(accuracy)
+                # 将所有accurancy收集起来,本质就是all_gather
                 test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
                 writer.add_scalar("test/accuracy", test_accuracy, global_step)
                 if accelerator.is_main_process:
                     print("test/accuracy", test_accuracy, global_step)
 
                 # the part below is testing out some generations and KLs, not presented in the original code
-                data = next(iter_dataloader_bookcorpus)
-                queries = data["query_token"].to(device)
+                lm_data = next(iter_dataloader_bookcorpus_lm)
+                queries = lm_data["query_token"].to(device)
                 context_length = queries.shape[1]
-                queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+                queries = right_padding_to_left_padding(lm_data["query_token"], tokenizer.pad_token_id).to(device)
                 query_responses = generate(
-                    accelerator.unwrap_model(reward_model).lm_backbone,
+                    accelerator.unwrap_model(reward_model).lm_backbone, # 此时不再需要分布式模型了
                     queries,
                     tokenizer,
                     generation_config,
                 )
-                responses = query_responses[:, context_length:]
+                # 只取response部分
+                responses:TensorType["batch", "resp_len", int] = query_responses[:, context_length:]
 
                 output, reward = get_reward(reward_model, query_responses, tokenizer)
-                logits = output.logits[:, context_length - 1 : -1]
-                logits /= args.task.temperature
+                # logits往左移了一位,即来预测后一个token_id
+                logits = output.logits[:, context_length - 1 : -1] # 进入softmax之前为logits
+                logits /= args.task.temperature # 使用temperature放大logits,增强头部效应
+                # 计算log_softmax, 即log(softmax(x)), 是为了数值稳定性
+                # all_logprobs:[batch, resp_len, vocab_size]
                 all_logprobs = F.log_softmax(logits, dim=-1)
-                logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                # responses:[batch, resp_len] => [batch, resp_len, 1]
+                # gather:out[i][j][k] = input[i][j][index[i][j][k]], 即收集所有token的logprobs
+                # logprobs:[batch, seq_len], float
+                logprobs:TensorType['batch', 'resp_len', float] = torch.gather(all_logprobs, dim=2, index=responses.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                output, _ = get_reward(untrained_model, query_responses, tokenizer)
-                logits = output.logits[:, context_length - 1 : -1]
+                output, _ = get_reward(reference_model, query_responses, tokenizer)
+                logits = output.logits[:, context_length - 1 : -1] # 进入softmax之前为logits
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
                 ref_logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                kl = logprobs - ref_logprobs
+                # logprobs, ref_logprobs:[batch, seq_len], 计算logprobs, ref_logprobs之间的kl分布差异, 注意：这个是在选中的reponse token_id上的概率分布的kl散度
+                kl = logprobs - ref_logprobs # KL=p*log(p/q)=p*(logp-logq)=plogp-plogq，其中的分布p哪里去了，是隐藏在采样数据即为分布p
+                # kl_sum:[batch]
                 kl_sum = kl.sum(axis=1)
-                all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
-                all_query_responses = tokenizer.batch_decode(query_responses, skip_special_tokens=True)
-                all_responses = [x[len(y) :] for x, y in zip(all_query_responses, all_decode_queries)]
+                all_decode_queries:List[str] = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                all_query_responses :List[str]= tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+                all_responses = [qr[len(q) :] for qr, q in zip(all_query_responses, all_decode_queries)] # 只取response
                 all_df = pd.DataFrame(
                     {
                         "query": all_decode_queries,
@@ -646,6 +710,24 @@ def train(args: Args):
                 )
                 if accelerator.is_main_process and args.track:
                     wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=global_step)
+
+                """
+                rich table的输出，确实比较好看
+                ────────────────────────────────────────────────────────────── Sample Output at Step 10 ───────────────────────────────────────────────────────────────
+                ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
+                ┃ query                                                         ┃ response                                                       ┃ kl                 ┃
+                ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┩
+                │ The data fields are the same among all splits. There is no    │  feature space is the same in each split, not the other.       │ 10.75289535522461  │
+                │ label or target associated with each instance (book). The     │ This is a problem for all data sources (files,                 │                    │
+                ├───────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼────────────────────┤
+                │ In the original dataset described by Zhu and Kiros et al.,    │  documents and 25,000 sets of documents. For each set of       │ 1.4629112482070923 │
+                │ BookCorpus contained 11,038                                   │ documents, the number of documents and                         │                    │
+                ├───────────────────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────┼────────────────────┤
+                │ The data fields are the same among all splits. There is no    │  training and test data can be used to contrast the features   │ 0.8583564758300781 │
+                │ label or target associated with each instance (book). The     │ of the datasets.                                               │                    │
+                │                                                               │ The data is categorical, which is a                            │                    │
+                └───────────────────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────┴────────────────────┘
+                """
                 print_rich_table(f"Sample Output at Step {global_step}", all_df[:4], console)
                 del (
                     query_responses,
@@ -666,13 +748,13 @@ def train(args: Args):
             + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
-        normalize(
+        reward_normalize(
             args,
             accelerator,
             device,
-            untrained_model.lm_backbone,
+            reference_model.lm_backbone,
             reward_model,
-            iter_dataloader_bookcorpus,
+            iter_dataloader_bookcorpus_lm,
             generation_config,
             tokenizer,
         )
@@ -684,7 +766,10 @@ def train(args: Args):
 
     # save model
     if args.save_path:
-        accelerator.save_model(reward_model, args.save_path)
+        # 注：accelerator保存的模型好像加载时有问题
+        #accelerator.save_model(reward_model, args.save_path)
+        #保存模型
+        torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path+"/pytorch.bin")
 
     if accelerator.is_main_process and args.track:
         wandb.finish()

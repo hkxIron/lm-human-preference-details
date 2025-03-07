@@ -1,17 +1,10 @@
-import warnings
-
-from transformers.tokenization_utils import PreTrainedTokenizer
-from transformers.tokenization_utils_base import EncodingFast
-from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
 import functools
 import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,14 +20,14 @@ from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
 from torch import Tensor, optim
+from torch.optim.optimizer import (
+    _dispatch_sqrt,
+    _get_value,
+    _use_grad_for_differentiable,
+)
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-from typing import Annotated
-from torchtyping import TensorType
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from safetensors.torch import load_file
-
 
 
 @dataclass
@@ -101,46 +94,33 @@ class Args:
     # common args
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-
     seed: int = 1
     """seed of the experiment"""
-
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-
     wandb_project_name: str = "cleanrl"
     """the wandb's project name"""
-
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-
     cuda: bool = True
     """Whether to use cuda if available."""
-
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
-
     upload_model: bool = False
     "whether to upload the saved model to huggingface"
-
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
-
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-
     print_sample_output_freq: int = 10
     """How often to print sample output"""
-
     save_path: str = "models/policy"
     """Where to save the model"""
-
-    # use_tensorflow_adam: bool = True
-    # """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
-
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
@@ -154,6 +134,154 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
+
+
+def _single_tensor_adam(
+    params: List[Tensor],
+    grads: List[Tensor],
+    exp_avgs: List[Tensor],
+    exp_avg_sqs: List[Tensor],
+    max_exp_avg_sqs: List[Tensor],
+    state_steps: List[Tensor],
+    grad_scale: Optional[Tensor],
+    found_inf: Optional[Tensor],
+    *,
+    amsgrad: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    weight_decay: float,
+    eps: float,
+    maximize: bool,
+    capturable: bool,
+    differentiable: bool,
+):
+    assert grad_scale is None and found_inf is None
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i]
+        exp_avg_sq = exp_avg_sqs[i]
+        step_t = state_steps[i]
+        # update step
+        step_t += 1
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+        step = _get_value(step_t)
+
+        ### pytorch adam implementation:
+        # bias_correction1 = 1 - beta1 ** step
+        # bias_correction2 = 1 - beta2 ** step
+        # step_size = lr / bias_correction1
+        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
+        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        # param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        ### tensorflow adam implementation:
+        lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
+        denom = exp_avg_sq.sqrt().add_(eps)
+        param.addcdiv_(exp_avg, denom, value=-lr_t)
+
+
+def adam(
+    params: List[Tensor],
+    grads: List[Tensor],
+    exp_avgs: List[Tensor],
+    exp_avg_sqs: List[Tensor],
+    max_exp_avg_sqs: List[Tensor],
+    state_steps: List[Tensor],
+    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+    foreach: Optional[bool] = None,
+    capturable: bool = False,
+    differentiable: bool = False,
+    fused: Optional[bool] = None,
+    grad_scale: Optional[Tensor] = None,
+    found_inf: Optional[Tensor] = None,
+    *,
+    amsgrad: bool,
+    beta1: float,
+    beta2: float,
+    lr: float,
+    weight_decay: float,
+    eps: float,
+    maximize: bool,
+):
+    func = _single_tensor_adam
+
+    func(
+        params,
+        grads,
+        exp_avgs,
+        exp_avg_sqs,
+        max_exp_avg_sqs,
+        state_steps,
+        amsgrad=amsgrad,
+        beta1=beta1,
+        beta2=beta2,
+        lr=lr,
+        weight_decay=weight_decay,
+        eps=eps,
+        maximize=maximize,
+        capturable=capturable,
+        differentiable=differentiable,
+        grad_scale=grad_scale,
+        found_inf=found_inf,
+    )
+
+
+class AdamTensorFlowStyle(optim.Adam):
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        self._cuda_graph_capture_health_check()
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            beta1, beta2 = group["betas"]
+
+            self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+            )
+
+            adam(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                amsgrad=group["amsgrad"],
+                beta1=beta1,
+                beta2=beta2,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                eps=group["eps"],
+                maximize=group["maximize"],
+                foreach=group["foreach"],
+                capturable=group["capturable"],
+                differentiable=group["differentiable"],
+                fused=group["fused"],
+                grad_scale=getattr(self, "grad_scale", None),
+                found_inf=getattr(self, "found_inf", None),
+            )
+
+        return loss
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -183,23 +311,21 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
-    def __init__(self, lm_backbone:AutoModelForCausalLM):
+    def __init__(self, lm_backbone):
         super().__init__()
-        self.lm_backbone:AutoModelForCausalLM = lm_backbone
+        self.lm_backbone = lm_backbone
         self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
 
-    def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType['batch',1, float]]:
-        output:CausalLMOutputWithPast  = self.lm_backbone(**kwargs)
-        # hidden_states shape: [batch_size, length, hidden_size]
+    def forward(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
         return output, self.scalar_head(output.hidden_states[-1])
 
 
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
-        self.lm_backbone:AutoModelForCausalLM = lm_backbone
+        self.lm_backbone = lm_backbone
         self.scalar_head = layer_init(
             nn.Linear(lm_backbone.config.hidden_size, 1),
             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
@@ -207,7 +333,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
-    def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
+    def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
         reward_latents = output.hidden_states[-1]
         # shape: [batch_size, length, hidden_size]
@@ -218,18 +344,15 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         reward = self.reward_gain * reward + self.reward_bias
         return output, reward
 
-#tokens:Annotated[torch.Tensor, Shape["batch,seq_len"]], 
-#tokens: TensorType["batch", "seq_len", int],
-def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
-                                  pad_id:int) -> TensorType["batch", "seq_len", int]:
+
+def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
-    # 将right padding转为left padding
-    # tokens:[batch, seq_len]
     assert tokens.ndim == 2
     return torch.tensor(
         [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
         device=tokens.device,
     )
+
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
@@ -241,15 +364,11 @@ def exact_div(a, b):
         raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
     return q
 
-def generate(lm_backbone:AutoModelForCausalLM, 
-             queries:TensorType["batch", "seq_len", int], 
-             tokenizer:AutoTokenizer, generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
+
+def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
-    # queries:[batch, seq_len]
     context_length = queries.shape[1]
-    attention_mask = queries != tokenizer.pad_token_id # 左padding
-    # 可能是为了适配？将tokenizer_pad_id填充为0
-    # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
+    attention_mask = queries != tokenizer.pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     output = lm_backbone.generate(
         input_ids=input_ids,
@@ -258,15 +377,11 @@ def generate(lm_backbone:AutoModelForCausalLM,
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
-    # queries:[batch, seq_len=24]
-    # output.sequences:[batch, gen_seq_len=48]
-    # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,
-    # 之所以需要拼接，是因为从queryies中复制的input_ids中的对query里的pad_id替换为0了与原始queries中的pad_id不同
+    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
-def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
-               query_responses:TensorType["batch", "seq_len", int], 
-               tokenizer:AutoTokenizer)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
+
+def get_reward(reward_model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -279,9 +394,7 @@ def get_reward(reward_model:AutoModelForCausalLMWithRewardHead,
     )
 
 
-def forward(policy:AutoModelForCausalLMWithScalarHead, 
-            query_responses:TensorType["batch", "seq_len", int], 
-            tokenizer:AutoTokenizer):
+def forward(policy, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = query_responses.clone()
@@ -294,14 +407,6 @@ def forward(policy:AutoModelForCausalLMWithScalarHead,
         output_hidden_states=True,
     )
 
-def process_query_data(x, base_model: str, response_length: int) -> dict[str, Any | EncodingFast]:  # added args so it's hashable
-    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(base_model)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    return {
-        "query_token": tokenizer(
-            x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
-        )["input_ids"],
-    }
 
 def train(args: Args):
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
@@ -320,7 +425,6 @@ def train(args: Args):
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
-
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
     writer.add_histogram = lambda x, y, z: None
@@ -349,8 +453,7 @@ def train(args: Args):
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-
-    tokenizer: PreTrainedTokenizer | PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
         trust_remote_code=True,
@@ -361,15 +464,8 @@ def train(args: Args):
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
     if args.rewards.trained_model:
-        #reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
-        print(f"{reward_model=}")
-        stat_dict = torch.load(args.rewards.trained_model)
-
-        #print(f"{stat_dict.keys()=}")
-        reward_model.load_state_dict(state_dict=stat_dict)
-        reward_model.to(device)
+        reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
-
     # each class should have a separate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
@@ -379,20 +475,27 @@ def train(args: Args):
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
     policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    #dataset = load_dataset("bookcorpus", split="train")
-    dataset = load_dataset("json", split='train', data_files={
-        "train":"./data/bookcorpus/*.jsonl",
-        "test":["./data/bookcorpus/sample2.jsonl", "./data/bookcorpus/sample3.jsonl"]})#.select(range(1000))
-
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    else:
+        optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    dataset = load_dataset("bookcorpus", split="train")
     dataset = dataset.shuffle(seed=local_seed)
+
+    def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        return {
+            "query_token": tokenizer(
+                x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
+            )["input_ids"],
+        }
 
     dataset.set_transform(
         functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
     )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
-
     if args.deepspeed:
         import deepspeed
 
@@ -400,8 +503,7 @@ def train(args: Args):
         # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
         # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
-            "train_micro_batch_size_per_gpu": 1,
-            #"train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             # "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
@@ -594,7 +696,7 @@ def train(args: Args):
                 gradient_accumulation_idx = 0
                 for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
                     with accelerator.accumulate(policy):
-                        micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+                        micro_batch_end = `micro_batch_start + args.ppo.local_micro_batch_size
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
                         mb_advantage = advantages[micro_batch_inds]
@@ -702,7 +804,6 @@ def train(args: Args):
     if args.save_path:
         accelerator.save_model(policy, args.save_path)
 
-        # 保存到hf中
         if accelerator.is_main_process and args.upload_model:
             from huggingface_hub import add_collection_item, create_collection, whoami
 
