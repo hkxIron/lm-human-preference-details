@@ -190,12 +190,15 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
     # 返回lm的output以及reward打分
     def forward(self, **kwargs)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
         output = self.lm_backbone(**kwargs)
-        reward_latents = output.hidden_states[-1]
-        # shape: [batch_size, length, hidden_size]
+        # output.hidden_states:layer_num * [batch, seq_len, hidden_size]
+        # reward_latents shape: [batch_size, length, hidden_size]
+        reward_latents = output.hidden_states[-1] # 只取最后一层的hidden_states
+
+        # last_reward_latents: [batch_size, hidden_size]
         last_reward_latents = reward_latents[:, -1, :] # 只取seq最后一个token的hidden_state
-        # shape: [batch_size, hidden_size]
+        # reward: [batch_size, 1]
         reward = self.scalar_head(last_reward_latents)
-        # shape: [batch_size, 1]
+        # reward: [batch_size, 1]
         reward = self.reward_gain * reward + self.reward_bias
         return output, reward
 
@@ -250,7 +253,7 @@ def generate(lm_backbone:AutoModelForCausalLM,
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
+def get_lm_result_and_sentence_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
                query_responses:TensorType["batch", "seq_len", int], 
                tokenizer:AutoTokenizer)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -317,7 +320,7 @@ def reward_normalize(
         # compute reward statistics
         rewards = []
         for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
+            rewards.append(get_lm_result_and_sentence_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -342,7 +345,7 @@ def reward_normalize(
             sample_queries_responses.append(query_responses)
         rewards = []
         for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
+            rewards.append(get_lm_result_and_sentence_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -353,9 +356,7 @@ def reward_normalize(
         after mean: 0.10747156292200089, after std: 1.453482747077942
         """
 
-def process_query_data_of_bookcorpus(x, base_model: str, response_length: int):  # added args so it's hashable
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+def process_query_data_of_bookcorpus(x, tokenizer: transformers.PreTrainedTokenizer, response_length: int):  # added args so it's hashable
     # tokenizer.__call__会返回input_ids,attention_mask, label_ids
     return {
         "query_token": tokenizer(
@@ -373,9 +374,7 @@ def process_query_data_of_bookcorpus(x, base_model: str, response_length: int): 
     "best": 1
 }
 """
-def process_data_of_human_preference(x:Dict, base_model: str, response_length: int):  # added args so it's hashable
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+def process_data_of_human_preference(x:Dict, tokenizer: transformers.PreTrainedTokenizer, response_length: int):  # added args so it's hashable
     # tokenizer.__call__会返回input_ids,attention_mask, label_ids
     return dict([
         (key, tokenizer(
@@ -402,7 +401,7 @@ def train(args: Args):
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
-    if accelerator.is_main_process: # 即只有主进程才使用tensorboard
+    if accelerator.is_main_process: # 即只有主进程才使用tensorboard writer
         if args.track:
             import wandb
             wandb.init(
@@ -464,7 +463,9 @@ def train(args: Args):
     print(f"some examples:{bookcorpus_dataset[0:3]=}")
     bookcorpus_dataset = bookcorpus_dataset.shuffle(seed=local_seed)
 
-    bookcorpus_dataset.set_transform(functools.partial(process_query_data_of_bookcorpus, base_model=args.base_model, response_length=args.task.response_length))
+    tokenizer_for_query: transformers.PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.base_model)
+    tokenizer_for_query.add_special_tokens({"pad_token": "[PAD]"})
+    bookcorpus_dataset.set_transform(functools.partial(process_query_data_of_bookcorpus, tokenizer=tokenizer_for_query, response_length=args.task.response_length))
 
     # torch.dataloader
     bookcorpus_dataloader = DataLoader(bookcorpus_dataset, batch_size=args.local_rollout_batch_size)
@@ -493,9 +494,9 @@ def train(args: Args):
         }
         # 注意：此处只对eval model启用deepspeed推理
         reference_model, *_ = deepspeed.initialize(model=reference_model, config=eval_deepspeed_config)
+        reference_model.eval()
     else:
         reference_model = reference_model.to(device)
-    reference_model.eval()
 
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
@@ -542,7 +543,7 @@ def train(args: Args):
         data_files="./data/lm-human-preferences/*.jsonl",
         #data_files=[args.label_dataset]
     )["train"] #.select(range(1000))
-    label_dataset.set_transform(functools.partial(process_data_of_human_preference, base_model=args.base_model, response_length=args.task.response_length))
+    label_dataset.set_transform(functools.partial(process_data_of_human_preference, tokenizer=tokenizer_for_query, response_length=args.task.response_length))
 
     print(f"label datasets:{label_dataset}")
     print("Num labels found in source:", len(label_dataset))
@@ -595,7 +596,7 @@ def train(args: Args):
                 for i in range(args.labels.num_labels):
                     query_responses :TensorType['batch=1','seq_len', int]= torch.cat([mb_query, mb_responses[i]], dim=1)
                     query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
-                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                    reward = get_lm_result_and_sentence_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(reward.view(-1))
 
                 # 从4个答案中直接预测哪个最好，而不是RLHF中的pairwise两两一组判断进行二分类
@@ -646,7 +647,8 @@ def train(args: Args):
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
                             query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
-                            reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                            # 注意：计算reward时，是query+response一起进行计算的
+                            reward = get_lm_result_and_sentence_reward(reward_model, query_responses, tokenizer)[1]
                             predicted_rewards.append(reward.view(-1))
 
                         predicted_rewards = torch.stack(predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
@@ -672,7 +674,7 @@ def train(args: Args):
                 # 只取response部分
                 responses:TensorType["batch", "resp_len", int] = query_responses[:, context_length:]
 
-                output, reward = get_reward(reward_model, query_responses, tokenizer)
+                output, reward = get_lm_result_and_sentence_reward(reward_model, query_responses, tokenizer)
                 # logits往左移了一位,即来预测后一个token_id
                 logits = output.logits[:, context_length - 1 : -1] # 进入softmax之前为logits
                 logits /= args.task.temperature # 使用temperature放大logits,增强头部效应
@@ -686,7 +688,7 @@ def train(args: Args):
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                output, _ = get_reward(reference_model, query_responses, tokenizer)
+                output, _ = get_lm_result_and_sentence_reward(reference_model, query_responses, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1] # 进入softmax之前为logits
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
@@ -768,7 +770,7 @@ def train(args: Args):
     if args.save_path:
         # 注：accelerator保存的模型好像加载时有问题
         #accelerator.save_model(reward_model, args.save_path)
-        #保存模型
+        #保存模型, 只保存存state_dict权重，而不是所有模型以及配置
         torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path+"/pytorch.bin")
 
     if accelerator.is_main_process and args.track:

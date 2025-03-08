@@ -13,6 +13,7 @@
             "module": "accelerate.commands.launch",          //调试accelerate launch,如果是python就不用
             "console": "integratedTerminal",
             "args":[ 
+                "--main_process_port", "29504",
                 "--num_processes", "2",
                 "./lm_human_preference_details/train_reward_accelerate.py",
                 "--base_model", "${env:HOME}/data/work/hf_data_and_model/models/Qwen/Qwen1.5-0.5B/",
