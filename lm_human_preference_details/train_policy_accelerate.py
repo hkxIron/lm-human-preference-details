@@ -720,7 +720,7 @@ def train(args: Args):
                         pg_clipfrac = (pg_losses_clipped > pg_losses_no_clip).float().mean()
 
                         # 总loss = policy(actor) loss + critic loss
-                        # 反向传播
+                        # 反向传播, 注意：当前在accelerator.accumulate(policy) context中，并不会马上执行反向传播，而是在离开context时执行，因此达到grad_accumulate的目的
                         loss = pg_loss + args.ppo.vf_coef * vf_critic_loss
                         accelerator.backward(loss)
                         optimizer.step()

@@ -606,7 +606,9 @@ def train(args: Args):
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                 # loss:[batch], float
                 loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
-                accelerator.backward(loss) # 此处在每个micro_batch里就调用用optimizer更新了梯度，此处grad_accumulation貌似并没有生效？
+
+                # 反向传播, 注意：当前在accelerator.accumulate(policy) context中，并不会马上执行反向传播，而是在离开context时执行，因此达到grad_accumulate的目的
+                accelerator.backward(loss) # 此处在每个micro_batch里就调用用optimizer更新了梯度，但在context中，因此不会马上执行
                 optimizer.step()  # accelerate handles gradient accumulation automatically
                 optimizer.zero_grad()
                 losses[gradient_accumulation_step] = loss
