@@ -484,6 +484,8 @@ def train(args: Args):
         lrnow = frac * args.ppo.lr
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
+
+        # 1. actor交互得到一批样本： 即利用当前policy生成一批query的response
         with torch.no_grad():
             queries = data["query_token"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
@@ -658,11 +660,12 @@ def train(args: Args):
             # resp_critic_values:[batch, resp_len]
             # advantages:[batch, resp_len]
             # returns:[batch, resp_len]
-            returns = advantages + resp_critic_values
+            discount_rewards = advantages + resp_critic_values
             advantages = whiten(advantages)
-            return_mean, return_var = returns.mean(), returns.var()
-            value_mean, value_var = resp_critic_values.mean(), resp_critic_values.var()
+            discount_reward_mean, discount_reward_var = discount_rewards.mean(), discount_rewards.var()
+            critic_value_mean, critic_value_var = resp_critic_values.mean(), resp_critic_values.var()
 
+        # 2. 每次从上面的样本中采样小部分样本，并更新若干次模型
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             b_inds = np.random.permutation(args.ppo.local_batch_size)
@@ -675,7 +678,7 @@ def train(args: Args):
                     with accelerator.accumulate(policy):
                         micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                        mb_return = returns[micro_batch_inds] # [batch, resp_len]
+                        mb_return = discount_rewards[micro_batch_inds] # [batch, resp_len]
                         mb_advantage = advantages[micro_batch_inds] # [batch, resp_len]
                         mb_values = resp_critic_values[micro_batch_inds] # [batch, resp_len]
                         mb_responses = responses[micro_batch_inds] # [batch ,resp_len]
@@ -765,6 +768,7 @@ def train(args: Args):
                         importance_sampling_ratio.mean().item(),
                     )
 
+        # 3.写入tensorboard
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram` for deepspeed
                 writer.add_histogram("ppo/val/ratio_hist", importance_sampling_ratio, update_ppo)
@@ -793,13 +797,13 @@ def train(args: Args):
             writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update_ppo)
             writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update_ppo)
-            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update_ppo)
-            writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update_ppo)
+            writer.add_scalar("ppo/returns/mean", accelerator.gather(discount_reward_mean).mean().item(), update_ppo)
+            writer.add_scalar("ppo/returns/var", accelerator.gather(discount_reward_var).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred_critic.mean()).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/error", accelerator.gather(vf_critic_losses_no_clip.mean()).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_critic_clipfrac).mean().item(), update_ppo)
-            writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update_ppo)
-            writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update_ppo)
+            writer.add_scalar("ppo/val/mean", accelerator.gather(critic_value_mean).mean().item(), update_ppo)
+            writer.add_scalar("ppo/val/var", accelerator.gather(critic_value_var).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/ratio", accelerator.gather(importance_sampling_ratio.mean()).mean().item(), update_ppo)
             writer.add_scalar("ppo/val/ratio_var", accelerator.gather(importance_sampling_ratio.mean()).var().item(), update_ppo)
             writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update_ppo)
@@ -810,7 +814,7 @@ def train(args: Args):
             kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
             del kl_divergence, mean_kl, mean_entropy, mean_non_score_reward, reward_scores
 
-    # save model
+    # 4. save model
     if args.save_path:
         #accelerator.save_model(policy, args.save_path)
         torch.save(accelerator.unwrap_model(policy).state_dict(), args.save_path+"/pytorch.bin")
