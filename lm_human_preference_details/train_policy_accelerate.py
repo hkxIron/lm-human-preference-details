@@ -54,12 +54,12 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     #total_episodes: int = 1000000
-    total_episodes: int = 100
-    local_batch_size: int = 64
+    total_episodes: int = 10000
+    local_batch_size: int = 32
     local_mini_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2
     """gradient accumulation steps"""
     local_micro_batch_size: tyro.conf.Suppress[int] = None
     """per rank micro batch size"""
@@ -67,7 +67,7 @@ class PpoHParams:
     batch_size: tyro.conf.Suppress[int] = None
     minibatch_size: tyro.conf.Suppress[int] = None
     num_updates: tyro.conf.Suppress[int] = None
-    nminibatches: int = 1
+    nminibatches: int = 4
     noptepochs: int = 4
     lr: float = 0.00001
     eps: float = 1e-5
@@ -82,15 +82,15 @@ class PpoHParams:
 @dataclass
 class TaskHParams:
     # Query params
-    query_length: int = 64
+    query_length: int = 128
     #query_dataset: str = "books"
 
     # Response params
-    response_length: int = 24
+    response_length: int = 24 # query中生成的token如果越过这个数，也会截断
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: int = 13 # 其实是句号，即tokenizer.convert_ids_to_tokens([13]) = ['.']
-    truncate_is_valid_after_token_num: int = 16 # 在16个token以后再出现truncate_token均认为是句子结束
+    min_token_num_of_truncate: int = 16 # 在16个token以后再出现truncate_token均认为是句子结束
     penalty_reward_value: int = -1
 
     # LM params
@@ -157,7 +157,8 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     console.print(table)
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+def layer_init(layer:nn.Module, std=np.sqrt(2), bias_const=0.0):
+    # 初始化weight, bias
     torch.nn.init.normal_(layer.weight, std=std)
     torch.nn.init.constant_(layer.bias, val=bias_const)
     return layer
@@ -190,7 +191,6 @@ def whiten(values:TensorType['batch', 'seq_len', float], shift_mean=True):
     return whitened
 
 
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, lm_backbone:AutoModelForCausalLM):
         super().__init__()
@@ -199,6 +199,7 @@ class AutoModelForCausalLMWithScalarHead(nn.Module):
 
     """
     注意：此处policy与critic共享了一个LM主体，它们共享参数，最后只是接不同的头得到不同的结果
+    但在原始游戏PPO的场景中，一般actor, critic并不共享网络参数
     """
     def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType['batch', 'seq_len',1, float]]:
         actor_lm_pred:CausalLMOutputWithPast = self.lm_backbone(**kwargs)
@@ -224,7 +225,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
-    # 返回lm的output以及reward打分
+    # 返回lm的output以及整个sentence的reward打分
     def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
         output = self.lm_backbone(**kwargs)
         # output.hidden_states:(layer_num+1) * [batch, seq_len, hidden_size], 在qwen2系列中，有layer_num+1层hidden_state, 原因是将最开始的input_embedding作为第0层的hidden_state
@@ -236,7 +237,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         # reward: [batch_size, 1], 句子级别的reward，即只有最后一个token才会有reward
         reward = self.scalar_head(last_reward_latents)
         # reward: [batch_size, 1]
-        reward = self.reward_gain * reward + self.reward_bias
+        reward = self.reward_gain * reward + self.reward_bias # 为何需要对reward进行缩放与平移
         return output, reward
 
 #tokens:Annotated[torch.Tensor, Shape["batch,seq_len"]], 
@@ -247,10 +248,12 @@ def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
     # 将right padding转为left padding
     # tokens:[batch, seq_len]
     assert tokens.ndim == 2
-    return torch.tensor(
+    left_padding_tokens = torch.tensor(
         [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
         device=tokens.device,
-    )
+    ) #.long()
+    return left_padding_tokens
+
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
@@ -286,20 +289,19 @@ def generate(lm_backbone:AutoModelForCausalLM,
     # 之所以需要拼接，是因为从queryies中复制的input_ids中的对query里的pad_id替换为0了与原始queries中的pad_id不同
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
-def get_lm_result_and_sentence_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
+def get_sentence_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
                query_responses:TensorType["batch", "seq_len", int], 
-               tokenizer:AutoTokenizer)->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
+               tokenizer:AutoTokenizer)->TensorType["batch",1, float]:
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return reward_model(
+    return reward_model.forward(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
-    )
-
+    )[1]
 
 def get_policy_pred_and_critic_value(policy_model:AutoModelForCausalLMWithScalarHead, 
             query_responses:TensorType["batch", "seq_len", int], 
@@ -310,7 +312,7 @@ def get_policy_pred_and_critic_value(policy_model:AutoModelForCausalLMWithScalar
     input_ids[~attention_mask] = 0
     # critic_value: seq中的每个token都有critic value
     # V(st) = [x, y1,y2, ... , yt], 每个token都会有一个critic value
-    return policy_model(
+    return policy_model.forward(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -324,6 +326,18 @@ def process_query_data(x, tokenizer: PreTrainedTokenizer, response_length: int) 
             x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
         )["input_ids"],
     }
+
+def show_some_data(name:str, data:torch.Tensor, tokenizer:PreTrainedTokenizer):
+    # 打印点数据看下
+    batch_size = data.shape[0]
+    for idx in range(batch_size):
+        input_ids = (data[idx]).tolist()
+        text = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(input_ids))
+        print(f"======={name}=======")
+        print(f"idx:{idx}/{batch_size} {input_ids=}\n")
+        print(f"idx:{idx}/{batch_size} {text=}\n")
+        print(f"idx:{idx}/{batch_size} id to token map:{[(i, tokenizer.convert_ids_to_tokens(i)) for i in input_ids]}\n")
+
 
 """
 游戏中的ppo源代码见：
@@ -376,17 +390,14 @@ def train(args: Args):
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
 
-    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
-        args.base_model,
-        padding_side="right",
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.base_model,
+        padding_side="right", # 为何此处需要声明“右填充”
         trust_remote_code=True,
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
+    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         #reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"{reward_model=}")
@@ -414,9 +425,8 @@ def train(args: Args):
 
     tokenizer_for_query: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer_for_query.add_special_tokens({"pad_token": "[PAD]"})
-    dataset.set_transform(
-        functools.partial(process_query_data, tokenizer=tokenizer_for_query, response_length=args.task.response_length)
-    )
+    # 奇怪的是，此处并没有collator函数
+    dataset.set_transform(functools.partial(process_query_data, tokenizer=tokenizer_for_query, response_length=args.task.query_length))
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
 
@@ -442,12 +452,13 @@ def train(args: Args):
             "wall_clock_breakdown": False,
         }
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
-        reward_model.eval()
         ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=eval_ds_config)
-        ref_policy.eval()
     else:
         ref_policy = ref_policy.to(device)
         reward_model = reward_model.to(device)
+
+    reward_model.eval() # 注意, reward_model不再更新
+    ref_policy.eval() # 注意, policy_model不再更新
 
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
@@ -485,13 +496,19 @@ def train(args: Args):
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
 
-        # 1. actor交互得到一批样本： 即利用当前policy生成一批query的response
+        # ===================================
+        # 1. 先用actor(policy)生一批回答，得到一批样本： 即利用当前policy生成一批query的response
+        # ===================================
         with torch.no_grad():
-            queries = data["query_token"].to(device)
+            print(f"{update_ppo=} \n{data=}")
+            print(f"data shape:{data['query_token'].shape=}") # [batch=64, seq_len=64]
+            queries = data["query_token"].to(device) # [batch, seq_len]
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            print(f"sample data shape:{queries.shape}") # [batch=64, seq_len=64]
+            show_some_data("queries", queries[0:3], tokenizer)
             # query_responses:[batch, query_len+resp_len]
             query_responses = generate(
-                accelerator.unwrap_model(policy).lm_backbone,
+                accelerator.unwrap_model(policy).lm_backbone, # 预测时并不需要分布式
                 queries,
                 tokenizer,
                 generation_config,
@@ -504,21 +521,23 @@ def train(args: Args):
             # full_critic_values:[batch, query_len+resp_len, 1]            
             policy_output, full_critic_values = get_policy_pred_and_critic_value(policy, query_responses, tokenizer)
 
-            # resp_critic_values: [batch, resp_len, 1] -> [batch, resp_len]
+            # resp_critic_values: [batch, resp_len, 1] -> [batch, resp_len], 只取resp部分的critic value
             resp_critic_values = full_critic_values[:, context_length - 1 : -1].squeeze(-1)
             # outputs.logits:[batch, seq_len, vocab_size]
             # logits:[batch, resp_len, vocab_size]
             logits = policy_output.logits[:, context_length - 1 : -1] # 只取response部分的logits
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
+            # responses:[batch, resp_len], type:int
             # gather:out[i][j][k] = input[i][j][index[i][j][k]], 即收集所有token的logprobs
+            # all_logprobs:[batch, resp_len, vocab_size]
             # logprobs:[batch, resp_len]
             logprobs = torch.gather(all_logprobs, dim=2, index=responses.unsqueeze(-1)).squeeze(-1)
             del policy_output, logits, all_logprobs
             torch.cuda.empty_cache() # 减少GPU内存碎片
 
             ref_output, _ = get_policy_pred_and_critic_value(ref_policy, query_responses, tokenizer)
-            ref_logits = ref_output.logits[:, context_length - 1 : -1]
+            ref_logits = ref_output.logits[:, context_length - 1 : -1] # 只取resp部分
             ref_logits /= args.task.temperature
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
@@ -534,12 +553,12 @@ def train(args: Args):
             # 在truncate_after个token以内的truncate_token均忽略, 在truncate_after后开始计算第一个truncate_token出现的位置作为有效truncate_token
             truncate_after_or_token_mask = torch.cat(
                 [
-                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_is_valid_after_token_num], # 前truncate_after=16个token mask为0
-                    truncate_token_mask[:, args.task.truncate_is_valid_after_token_num :], # truncate_after=16后的token mask为原来的truncate_token_mask
+                    torch.zeros_like(truncate_token_mask)[:, : args.task.min_token_num_of_truncate], # 前truncate_after=16个token mask为0
+                    truncate_token_mask[:, args.task.min_token_num_of_truncate :], # truncate_after=16后的token mask为原来的truncate_token_mask
                 ],
                 dim=1,
             )
-            # truncate_mask:[batch, resp_len], 只要句子中在truncate_is_valid_after_token_num后出现truncate_token后，mask将一直为True
+            # truncate_mask:[batch, resp_len], 只要句子中在min_token_num_of_truncate后出现truncate_token后，mask将一直为True
             truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
             # postprocessed_responses:[batch, resp_len], 将responses中trunkcate_mask=True的地方填pad_token, 即response在16个token出现了句号之后,全部设为pad_token
             postprocessed_responses = torch.where(
@@ -555,24 +574,26 @@ def train(args: Args):
             # postprocessd_responses:[batch, resp_len]
             # postprocessed_query_responses:[batch, query_len+resp_len]
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+            show_some_data("postprocessed_query_responses",postprocessed_query_responses[:3], tokenizer)
+            # right_pading没必要，因为本身已经是left_padding
             postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
             # 计算query+response的reward分数, 每个句子只有一个reward分数，而不是每个token均有一个分数
             # reward_scores:[batch]
-            reward_scores = get_lm_result_and_sentence_reward(reward_model, postprocessed_query_responses, tokenizer)[1].flatten()
+            reward_scores_from_model = get_sentence_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
             # 不包含truncate_token的句子会得到一个较低的分数
             # postprocessed_responses:[batch, resp_len]
-            matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
+            matches_token = postprocessed_responses[:, args.task.min_token_num_of_truncate :] == args.task.truncate_token
             filter_mask = torch.any(matches_token, dim=-1) # 该句子resp中是否有truncate_token
             # 如果句子resp中含有truncate_token,则保留原始reward,否则给予-1分惩罚
             # reward_scores:[batch]
-            reward_scores = torch.where(
+            reward_scores_from_model = torch.where(
                 filter_mask,
-                reward_scores,
-                torch.full_like(reward_scores, args.task.penalty_reward_value),
+                reward_scores_from_model,
+                torch.full_like(reward_scores_from_model, args.task.penalty_reward_value),
             )
             del matches_token, filter_mask
             torch.cuda.empty_cache()
@@ -582,12 +603,12 @@ def train(args: Args):
             # ref_logprobs:[batch, resp_len]
             kl_divergence = logprobs - ref_logprobs
             # non_score_reward:[batch, resp_len]
-            non_score_reward = -kl_ctl.value * kl_divergence # KL散度取负作为reward
+            negative_kl_reward = -kl_ctl.value * kl_divergence # KL散度取负作为reward
             # rewards:[batch, resp_len]
-            rewards = non_score_reward.clone()
+            rewards = negative_kl_reward.clone()
             # 在每个句子的最后一个token上加上句子级别的reward，该reward来自于reward模型打分
             # reward_scores:[batch]
-            rewards[:, -1] += reward_scores
+            rewards[:, -1] += reward_scores_from_model
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
@@ -607,13 +628,14 @@ def train(args: Args):
                         {
                             "query": all_decode_queries,
                             "response": all_postprocessed_responses,
-                            "score": reward_scores.float().cpu().numpy(), # reward_scores:[batch]
+                            "score": reward_scores_from_model.float().cpu().numpy(), # reward_scores:[batch]
                             "kl": kl_sum.float().cpu().numpy(),
-                            "reward": (reward_scores - kl_ctl.value * kl_sum).float().cpu().numpy(), # 去掉了kl散度的分数，只留下reward模型的打分
+                            "reward": (reward_scores_from_model - kl_ctl.value * kl_sum).float().cpu().numpy(), # 去掉了kl散度的分数，只留下reward模型的打分
                         }
                     )
                     if accelerator.is_main_process and args.track:
                         wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update_ppo)
+                    # 打印
                     print_rich_table(f"Sample Output at Episode {global_step}", all_df[:4], console)
                 except Exception as e:
                     print(e)
@@ -628,30 +650,33 @@ def train(args: Args):
             torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
-            lastgaelam = 0
+            advantage = 0
             advantages_reversed = []
             gen_length = args.task.response_length
             """
             Compute generalized advantage estimate. 
             GAE: 在低方差与低偏置中取得平衡
             
+            TD error:
             delta(t) = R(t) + gamma * V(t+1) - V(t), 这就是TD_ERROR
+
+            GAE:
             A(t) = delta(t) + gamma * lambda * A(t+1)
             """
             for t in reversed(range(gen_length)):
                 # resp_critic_values:[batch, resp_len]
                 # next_critic_values: [batch, 1]
                 next_critic_values = resp_critic_values[:, t + 1] if t < gen_length - 1 else 0.0
-                # TD_ERROR = R(t) + gamma * V(t+1) - V(t)
+                # TD_ERROR = R(t) + gamma * V(t+1) - V(t)， R(t)为即时环境真实的reward,即-negative_kl + sentence_reward
                 # rewards来源于reward model + kl散度
                 # rewards:[batch, resp_len]
                 # next_critic_values, resp_critic_values: [batch, 1]
                 # delta:[batch, 1]
-                delta = rewards[:, t] + args.ppo.gamma * next_critic_values - resp_critic_values[:, t]
+                td_delta = rewards[:, t] + args.ppo.gamma * next_critic_values - resp_critic_values[:, t]
                 # lastgaelam:[batch, 1]
-                lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
+                advantage = td_delta + args.ppo.gamma * args.ppo.lam * advantage
                 # advantages:List[Tensor[batch, 1]]
-                advantages_reversed.append(lastgaelam)
+                advantages_reversed.append(advantage)
 
             # advantages:[batch, resp_len]
             advantages = torch.stack(advantages_reversed[::-1], axis=1)
@@ -659,14 +684,16 @@ def train(args: Args):
             # =>  Q(s,a) = A(s,a) + V(t), 其中Q(s, a)即为td target 的reward
             # resp_critic_values:[batch, resp_len]
             # advantages:[batch, resp_len]
-            # returns:[batch, resp_len]
+            # discount_rewards:[batch, resp_len]
             discount_rewards = advantages + resp_critic_values
             advantages = whiten(advantages)
             discount_reward_mean, discount_reward_var = discount_rewards.mean(), discount_rewards.var()
             critic_value_mean, critic_value_var = resp_critic_values.mean(), resp_critic_values.var()
 
+        # ===================================
         # 2. 每次从上面的样本中采样小部分样本，并更新若干次模型
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+        # ===================================
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             b_inds = np.random.permutation(args.ppo.local_batch_size)
             minibatch_idx = 0
@@ -678,7 +705,7 @@ def train(args: Args):
                     with accelerator.accumulate(policy):
                         micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                        mb_return = discount_rewards[micro_batch_inds] # [batch, resp_len]
+                        mb_discount_rewards = discount_rewards[micro_batch_inds] # [batch, resp_len]
                         mb_advantage = advantages[micro_batch_inds] # [batch, resp_len]
                         mb_values = resp_critic_values[micro_batch_inds] # [batch, resp_len]
                         mb_responses = responses[micro_batch_inds] # [batch ,resp_len]
@@ -702,15 +729,17 @@ def train(args: Args):
                             mb_values - args.ppo.cliprange_value,
                             mb_values + args.ppo.cliprange_value,
                         )
-                        vf_critic_losses_no_clip = torch.square(vpred_critic - mb_return)
-                        vf_critic_losses_clipped = torch.square(vpred_critic_clipped - mb_return)
+                        vf_critic_losses_no_clip = torch.square(vpred_critic - mb_discount_rewards)
+                        vf_critic_losses_clipped = torch.square(vpred_critic_clipped - mb_discount_rewards)
                         vf_critic_loss = 0.5 * torch.max(vf_critic_losses_no_clip, vf_critic_losses_clipped).mean()
+                        # 因为clipped后的值范围更小，所以与mb_discount_rewards的差距会更大，因此可以用下面的计算clipped占比
                         vf_critic_clipfrac = (vf_critic_losses_clipped > vf_critic_losses_no_clip).float().mean() # clipped的占比
 
                         # mb_logprobs:[batch, resp_len], 老策略的logits
                         # new_logprobs:[batch, resp_len], ppo更新后online新策略的logits
                         logprobs_diff = new_logprobs - mb_logprobs # [batch, resp_len]
 
+                        # ppo公式
                         # policy_gradient_Loss = Expect_{x~Pai(old)} { Pai(new)/Pai(old) *Advantage(Pai(old))}
                         # 重要性采样的比率
                         importance_sampling_ratio = torch.exp(logprobs_diff) # [batch, resp_len]
@@ -737,6 +766,7 @@ def train(args: Args):
 
                          因此entropy = sum(-pi*xi+pi*log(sum(exp(xi)))) 
                          对应于下式中：logits = xi, prob_dist=pi
+                         那为何不用原始值计算，应该是为了数值计算稳定性
                         """
                         # entropy:[batch, resp_len, vocab_size], 计算policy的LM的熵
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1) 
@@ -750,25 +780,20 @@ def train(args: Args):
                             vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_critic_loss
                             vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_critic_clipfrac
                             entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
 
                 if accelerator.is_main_process:
-                    console.print(
-                        f"ppo_epoch_idx",
-                        ppo_epoch_idx,
-                        "approxkl",
-                        approxkl.item(),
-                        "pg_loss",
-                        pg_loss.item(),
-                        "pg_clipfrac",
-                        pg_clipfrac.item(),
-                        "ratio",
-                        importance_sampling_ratio.mean().item(),
+                    console.print(f"ppo_epoch_idx", ppo_epoch_idx,
+                        "approxkl", approxkl.item(),
+                        "pg_loss", pg_loss.item(),
+                        "pg_clipfrac", pg_clipfrac.item(),
+                        "importance_sampling_ratio", importance_sampling_ratio.mean().item(),
                     )
 
+        # ===================================
         # 3.写入tensorboard
+        # ===================================
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram` for deepspeed
                 writer.add_histogram("ppo/val/ratio_hist", importance_sampling_ratio, update_ppo)
@@ -778,13 +803,13 @@ def train(args: Args):
             # mean_kl:[batch,1]->float, 即每条样本算一个平均kl
             mean_kl = kl_divergence.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean() # float
-            mean_non_score_reward = non_score_reward.sum(1).mean()
+            mean_non_score_reward = negative_kl_reward.sum(1).mean()
             writer.add_scalar("objective/kl_coef", kl_ctl.value, update_ppo)
             writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update_ppo)
             writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update_ppo)
             writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update_ppo)
-            writer.add_scalar("objective/score_total", accelerator.gather(mean_non_score_reward + reward_scores.mean()).mean().item(), update_ppo)
-            writer.add_scalar("objective/scores", accelerator.gather(reward_scores.mean()).mean().item(), update_ppo)
+            writer.add_scalar("objective/score_total", accelerator.gather(mean_non_score_reward + reward_scores_from_model.mean()).mean().item(), update_ppo)
+            writer.add_scalar("objective/scores", accelerator.gather(reward_scores_from_model.mean()).mean().item(), update_ppo)
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update_ppo)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_critic_loss).mean().item(), update_ppo)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update_ppo)
@@ -812,9 +837,11 @@ def train(args: Args):
             writer.add_scalar("ppo/lr", lrnow, update_ppo)
             writer.add_scalar("ppo/episode", global_step, update_ppo)
             kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
-            del kl_divergence, mean_kl, mean_entropy, mean_non_score_reward, reward_scores
+            del kl_divergence, mean_kl, mean_entropy, mean_non_score_reward, reward_scores_from_model
 
+    # ===================================
     # 4. save model
+    # ===================================
     if args.save_path:
         #accelerator.save_model(policy, args.save_path)
         torch.save(accelerator.unwrap_model(policy).state_dict(), args.save_path+"/pytorch.bin")
