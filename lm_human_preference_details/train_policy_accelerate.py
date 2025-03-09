@@ -731,6 +731,7 @@ def train(args: Args):
                         )
                         vf_critic_losses_no_clip = torch.square(vpred_critic - mb_discount_rewards)
                         vf_critic_losses_clipped = torch.square(vpred_critic_clipped - mb_discount_rewards)
+                        # vf_critic_loss: float
                         vf_critic_loss = 0.5 * torch.max(vf_critic_losses_no_clip, vf_critic_losses_clipped).mean()
                         # 因为clipped后的值范围更小，所以与mb_discount_rewards的差距会更大，因此可以用下面的计算clipped占比
                         vf_critic_clipfrac = (vf_critic_losses_clipped > vf_critic_losses_no_clip).float().mean() # clipped的占比
@@ -745,12 +746,15 @@ def train(args: Args):
                         importance_sampling_ratio = torch.exp(logprobs_diff) # [batch, resp_len]
                         pg_losses_no_clip = -mb_advantage * importance_sampling_ratio # [batch, resp_len]
                         pg_losses_clipped = -mb_advantage * torch.clamp(importance_sampling_ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
+                        # pg_loss_no_clip:[batch, resp_len]
+                        # pg_loss_clipped:[batch, resp_len]
+                        # pg_loss:float, 对batch*resp_len求了平均，因此是一个scalar,mean也防止了长度带来的reward的偏置问题
                         pg_loss = torch.max(pg_losses_no_clip, pg_losses_clipped).mean()
                         pg_clipfrac = (pg_losses_clipped > pg_losses_no_clip).float().mean()
 
                         # 总loss = policy(actor) loss + critic loss
                         # 反向传播, 注意：当前在accelerator.accumulate(policy) context中，并不会马上执行反向传播，而是在离开context时执行，因此达到grad_accumulate的目的
-                        loss = pg_loss + args.ppo.vf_coef * vf_critic_loss
+                        loss = pg_loss + args.ppo.vf_coef * vf_critic_loss # loss: float
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
