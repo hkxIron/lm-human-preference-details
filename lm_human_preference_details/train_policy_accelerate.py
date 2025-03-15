@@ -342,6 +342,9 @@ def show_some_data(name:str, data:torch.Tensor, tokenizer:PreTrainedTokenizer):
 """
 游戏中的ppo源代码见：
 git@github.com:hkxIron/cleanrl.git
+
+grpo见：
+git@github.com:hkxIron/The_LM_book.git
 """
 def train(args: Args):
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
