@@ -532,7 +532,7 @@ def train(args: Args):
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
             # responses:[batch, resp_len], type:int
-            # gather:out[i][j][k] = input[i][j][index[i][j][k]], 即收集所有token的logprobs
+            # gather:out[i][j][k] = all_logprobs[i][j][index[i][j][k]], 即收集所有token的logprobs
             # all_logprobs:[batch, resp_len, vocab_size]
             # logprobs:[batch, resp_len]
             logprobs = torch.gather(all_logprobs, dim=2, index=responses.unsqueeze(-1)).squeeze(-1)
@@ -604,6 +604,15 @@ def train(args: Args):
             # 4. compute rewards
             # logprobs:[batch, resp_len]
             # ref_logprobs:[batch, resp_len]
+            # kl_divergence(p||q) = sum_x[ p(x)log(p(x)/q(x)) ] 
+            # = - sum_x[ p(x)log(q(x)/p(x)) ] 
+            # = p(x)log(p(x)) - p(x)log(q(x))
+            # = -p(x)log(q(x)) - (-p(x)log(p(x)))
+            # = cross_entropy - entropy 
+            # 其物理意义为:
+            # 熵:分布为p的数据,用分布p的熵所需的编码长度为1/(p(x))
+            # 交叉熵:分布为p的数据,用分布q的熵所需的编码长度为q(x)/(p(x))
+            # KL距离:用交叉熵比用熵编码多出的平均编码长度
             kl_divergence = logprobs - ref_logprobs
             # non_score_reward:[batch, resp_len]
             negative_kl_reward = -kl_ctl.value * kl_divergence # KL散度取负作为reward
