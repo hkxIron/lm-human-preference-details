@@ -209,6 +209,7 @@ class AutoModelForCausalLMWithScalarHead(nn.Module):
 
         # score: [batch, seq_len, 1], 注意：此处是对seq中的每个token都有critic value,用来预估reward value
         # V(st) = [x, y1,y2, ... , yt], 每个token都会有一个critic value
+        # 注意：这里是对每个token都会有一个value打分,即critic的V(st)需要
         critic_value = self.scalar_head(last_layer_hidden_states) 
         # reward_latents shape: [batch_size, length, hidden_size]
         return actor_lm_pred, critic_value
@@ -230,7 +231,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         output = self.lm_backbone(**kwargs)
         # output.hidden_states:(layer_num+1) * [batch, seq_len, hidden_size], 在qwen2系列中，有layer_num+1层hidden_state, 原因是将最开始的input_embedding作为第0层的hidden_state
         # reward_latents shape: [batch_size, length, hidden_size]
-        reward_latents = output.hidden_states[-1] # 只取最后一层的hidden_states
+        reward_latents = output.hidden_states[-1] # 只取最后一层的hidden_states, 注意：reward model只取最后一层的hidden_state的最后一个token进行打分  
 
         # last_reward_latents: [batch_size, hidden_size]
         last_reward_latents = reward_latents[:, -1, :] # 最后一个token的hidden_states
@@ -539,6 +540,7 @@ def train(args: Args):
             del policy_output, logits, all_logprobs
             torch.cuda.empty_cache() # 减少GPU内存碎片
 
+            # ref_policy model output 
             ref_output, _ = get_policy_pred_and_critic_value(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1] # 只取resp部分
             ref_logits /= args.task.temperature
@@ -581,12 +583,13 @@ def train(args: Args):
             # right_pading没必要，因为本身已经是left_padding
             postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
             # 计算query+response的reward分数, 每个句子只有一个reward分数，而不是每个token均有一个分数
-            # reward_scores:[batch]
+            # reward_scores:[batch], 利用query+resp计算score 
             reward_scores_from_model = get_sentence_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
+            # 即：只有含有truncate_token的才有正常的reward 
             # 不包含truncate_token的句子会得到一个较低的分数
             # postprocessed_responses:[batch, resp_len]
             matches_token = postprocessed_responses[:, args.task.min_token_num_of_truncate :] == args.task.truncate_token
@@ -674,6 +677,28 @@ def train(args: Args):
 
             GAE:
             A(t) = delta(t) + gamma * lambda * A(t+1)
+
+            举例:
+            A(st,at) = sum_{t} {lamada*gamma}^{l}*delta_{t+l}
+            delta_{t} = r(st, at) + gamma* V(s(t+1)) - V(st)
+            R(t) = A(st, at) + V(st)
+
+            假设序列为1,2,3...T-1,T
+            1.t=T
+            delta_{T} = r(s(T),a(T)) + 0 - V(S(T))
+            A(s(T+1),a(T+1)) = delta_{T}
+
+            2.t=T-1
+            delta_{T-1} = r(s(T-1),a(T-1)) + gamma*V(s(T)) - V(S(T-1))
+            A(s(T-1),a(T-1)) = delta_{T-1} + lamada*gamma*delta_{T}
+            = delta_{T-1} + lamada*gamma* A(s(T+1),a(T+1)) 
+
+            3.t=T-2
+            delta_{T-2} = r(s(T-2),a(T-2)) + gamma*V(s(T-1)) - V(S(T-2))
+            A(s(T-2),a(T-2)) = delta_{T-2} + (lamada*gamma)*delta_{T-1} + (lamada*gamma)^2*delta_{T}
+            = delta_{T-2} + (lamada*gamma)* A(s(T-1),a(T-1)), 即递归表示
+
+            rewards:[seq_len, seq_len]
             """
             for t in reversed(range(gen_length)):
                 # resp_critic_values:[batch, resp_len]
@@ -743,11 +768,12 @@ def train(args: Args):
                         )
                         vf_critic_losses_no_clip = torch.square(vpred_critic - mb_discount_rewards)
                         vf_critic_losses_clipped = torch.square(vpred_critic_clipped - mb_discount_rewards)
-                        # vf_critic_loss: float
+                        # vf_critic_loss: float, critic预测的value值不能差太多, 即V(st)
                         vf_critic_loss = 0.5 * torch.max(vf_critic_losses_no_clip, vf_critic_losses_clipped).mean()
                         # 因为clipped后的值范围更小，所以与mb_discount_rewards的差距会更大，因此可以用下面的计算clipped占比
                         vf_critic_clipfrac = (vf_critic_losses_clipped > vf_critic_losses_no_clip).float().mean() # clipped的占比
 
+                        # policy ppo loss
                         # mb_logprobs:[batch, resp_len], 老策略的logits
                         # new_logprobs:[batch, resp_len], ppo更新后online新策略的logits
                         logprobs_diff = new_logprobs - mb_logprobs # [batch, resp_len]
@@ -756,13 +782,13 @@ def train(args: Args):
                         # policy_gradient_Loss = Expect_{x~Pai(old)} { Pai(new)/Pai(old) *Advantage(Pai(old))}
                         # 重要性采样的比率
                         importance_sampling_ratio = torch.exp(logprobs_diff) # [batch, resp_len]
-                        pg_losses_no_clip = -mb_advantage * importance_sampling_ratio # [batch, resp_len]
+                        pg_losses_no_clip = -mb_advantage * importance_sampling_ratio # [batch, resp_len], PPO 的公式：Pai/Pai(old)*Advantage(st, at)
                         pg_losses_clipped = -mb_advantage * torch.clamp(importance_sampling_ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         # pg_loss_no_clip:[batch, resp_len]
                         # pg_loss_clipped:[batch, resp_len]
                         # pg_loss:float, 对batch*resp_len求了平均，因此是一个scalar,mean也防止了长度带来的reward的偏置问题
                         pg_loss = torch.max(pg_losses_no_clip, pg_losses_clipped).mean()
-                        pg_clipfrac = (pg_losses_clipped > pg_losses_no_clip).float().mean()
+                        pg_clipfrac = (pg_losses_clipped > pg_losses_no_clip).float().mean() # 计算clip的比例 
 
                         # 总loss = policy(actor) loss + critic loss
                         # 反向传播, 注意：当前在accelerator.accumulate(policy) context中，并不会马上执行反向传播，而是在离开context时执行，因此达到grad_accumulate的目的
@@ -785,6 +811,7 @@ def train(args: Args):
                          那为何不用原始值计算，应该是为了数值计算稳定性
                         """
                         # entropy:[batch, resp_len, vocab_size], 计算policy的LM的熵
+                        # 计算policy的熵,熵越大，代表policy多样性越高
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1) 
                         # logprobs_diff: [batch, resp_len]
                         # approxkl: float
