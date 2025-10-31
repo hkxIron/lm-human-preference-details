@@ -47,7 +47,7 @@ class AdaptiveKLParams:
 class RewardHParams:
     kl_coef: float = 0.15
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward/pytorch_model.bin"
+    trained_model: Optional[str] = "../models/reward/pytorch_model.bin"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -422,8 +422,8 @@ def train(args: Args):
     optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     #dataset = load_dataset("bookcorpus", split="train")
     dataset = load_dataset("json", split='train', data_files={
-        "train":"./data/bookcorpus/*.jsonl",
-        "test":["./data/bookcorpus/sample2.jsonl", "./data/bookcorpus/sample3.jsonl"]})#.select(range(1000))
+        "train":"../data/bookcorpus/*.jsonl",
+        "test":["../data/bookcorpus/sample2.jsonl", "../data/bookcorpus/sample3.jsonl"]})#.select(range(1000))
 
     dataset = dataset.shuffle(seed=local_seed)
 

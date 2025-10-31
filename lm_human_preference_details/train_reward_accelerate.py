@@ -456,8 +456,8 @@ def train(args: Args):
     # else:
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     bookcorpus_dataset = load_dataset("json", data_files={
-        "train":"./data/bookcorpus/*.jsonl",
-        "test":["./data/bookcorpus/sample2.jsonl", "./data/bookcorpus/sample3.jsonl"]})['train'] #.select(range(1000))
+        "train":"../data/bookcorpus/*.jsonl",
+        "test":["../data/bookcorpus/sample2.jsonl", "../data/bookcorpus/sample3.jsonl"]})['train'] #.select(range(1000))
 
     print(f"bookcorpus datasets:{bookcorpus_dataset}")
     print(f"some examples:{bookcorpus_dataset[0:3]=}")
@@ -540,7 +540,7 @@ def train(args: Args):
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label_dataset = load_dataset(
         path="json",
-        data_files="./data/lm-human-preferences/*.jsonl",
+        data_files="../data/lm-human-preferences/*.jsonl",
         #data_files=[args.label_dataset]
     )["train"] #.select(range(1000))
     label_dataset.set_transform(functools.partial(process_data_of_human_preference, tokenizer=tokenizer_for_query, response_length=args.task.response_length))
