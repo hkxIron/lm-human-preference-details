@@ -158,8 +158,6 @@ class Args:
 
 
 OPENAI_PAD_TOKEN_ID = 50259
-
-
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     table = Table(show_lines=True)
     for column in df.columns:
@@ -287,7 +285,7 @@ def get_lm_result_and_sentence_reward(reward_model:AutoModelForCausalLMWithRewar
     #print(f"{attention_mask=}")
     #print(f"{input_ids=}")
     # 返回lm的output以及reward打分
-    return reward_model(
+    return reward_model.forward(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -572,13 +570,13 @@ def train(args: Args):
         # x[process_index=1::num_process=3], 即从process_index开始取样，每隔num_process采样一条样本
         # accelerator.num_processes; 表示当前分布式训练中使用的总进程数,在数据并行训练中，num_processes 通常等于 GPU 的数量。
         print(f"{accelerator.process_index=} {accelerator.num_processes=}")
-        b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
+        b_inds = b_inds_all[accelerator.process_index:: accelerator.num_processes]  #  multi-GPU slicing
         # 梯度累加, 每次只取local_micro_batch_size个样本进行训练
         losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
         accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
         gradient_accumulation_step = 0
         for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
-            with accelerator.accumulate(reward_model): # 梯度累积context, 会禁止反向传播时梯度自动同步
+            with accelerator.accumulate(reward_model): # 梯度累积context, 会禁止反向传播时梯度自动同步, accelerator在声明时已经设置了gradient_accumulation_steps
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
 
@@ -608,7 +606,7 @@ def train(args: Args):
                 # mb_best:[batch], int
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                 # loss:[batch], float
-                loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
+                loss = torch.nn.functional.cross_entropy(input=predicted_rewards, target=mb_best)
 
                 # 反向传播, 注意：当前在accelerator.accumulate(policy) context中，并不会马上执行反向传播，而是在离开context时执行，因此达到grad_accumulate的目的
                 accelerator.backward(loss) # 此处在每个micro_batch里就调用用optimizer更新了梯度，但在context中，因此不会马上执行
@@ -640,9 +638,7 @@ def train(args: Args):
                         mb_query = torch.from_numpy(np.stack(mb_data["query"]))
                         mb_query = right_padding_to_left_padding(mb_query, tokenizer.pad_token_id).to(device) # 此处为何不等query与response拼接后再padding
                         mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-                        mb_responses = [
-                            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
-                        ]
+                        mb_responses = [ torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels) ]
                         # hack: deal with openai's padding token
                         mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
                         for item in mb_responses:
@@ -659,6 +655,7 @@ def train(args: Args):
                         predicted_rewards = torch.stack(predicted_rewards, dim=1)  # shape (batch_size, num_labels), basically a reward prediction for each label
                         accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                         test_accuracies.append(accuracy)
+
                 # 将所有accurancy收集起来,本质就是all_gather
                 test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
                 writer.add_scalar("test/accuracy", test_accuracy, global_step)
