@@ -175,6 +175,11 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+"""
+1. 基于最后一个token的hidden_states进行打分，得到整个sentence的reward
+2. 由于这个reward只有最后一个token才有，因此监督信号极为稀疏
+3. 目前在一些新的RL中，都使用基于规则的reward来替换基于模型的reward
+"""
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone:AutoModelForCausalLM):
         super().__init__()
@@ -202,8 +207,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         reward = self.reward_gain * reward + self.reward_bias
         return output, reward
 
-
-#tokens:Annotated[torch.Tensor, Shape["batch,seq_len"]], 
+#tokens: Annotated[torch.Tensor, Shape["batch,seq_len"]], 
 #tokens: TensorType["batch", "seq_len", int],
 def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
                                   pad_id:int) -> TensorType["batch", "seq_len", int]:
@@ -211,15 +215,14 @@ def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
     # 将right padding转为left padding
     # tokens:[batch, seq_len]
     assert tokens.ndim == 2
-    return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    )
-
+    # return torch.tensor( [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens], device=tokens.device,)
+    left_padding_tokens = torch.tensor([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
+         device=tokens.device,
+     ) #.long()
+    return left_padding_tokens
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
-
 
 def exact_div(a, b):
     q = a // b
@@ -227,10 +230,10 @@ def exact_div(a, b):
         raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
     return q
 
-
-def generate(lm_backbone:AutoModelForCausalLM, 
+def generate_sequence(language_model:AutoModelForCausalLM, 
              queries:TensorType["batch", "seq_len", int], 
-             tokenizer:AutoTokenizer, generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
+             tokenizer:AutoTokenizer, 
+             generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
     """generate in a way that does not affect padding tokens"""
     # 不影响padding token
     # queries:[batch, seq_len]
@@ -239,7 +242,7 @@ def generate(lm_backbone:AutoModelForCausalLM,
     # 可能是为了适配？将tokenizer_pad_id填充为0
     # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
-    output = lm_backbone.generate(
+    output = language_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
@@ -314,7 +317,7 @@ def reward_normalize(
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, tokenizer, generation_config)
+            query_responses = generate_sequence(lm_backbone, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
 
         # compute reward statistics
@@ -341,7 +344,7 @@ def reward_normalize(
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, tokenizer, generation_config)
+            query_responses = generate_sequence(lm_backbone, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
         rewards = []
         for query_responses in sample_queries_responses:
@@ -667,7 +670,7 @@ def train(args: Args):
                 queries = lm_data["query_token"].to(device)
                 context_length = queries.shape[1]
                 queries = right_padding_to_left_padding(lm_data["query_token"], tokenizer.pad_token_id).to(device)
-                query_responses = generate(
+                query_responses = generate_sequence(
                     accelerator.unwrap_model(reward_model).lm_backbone, # 此时不再需要分布式模型了
                     queries,
                     tokenizer,

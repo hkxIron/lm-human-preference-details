@@ -3,6 +3,8 @@ import warnings
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_base import EncodingFast
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+from train_reward_accelerate import AutoModelForCausalLMWithRewardHead, exact_div, generate_sequence, layer_init, print_rich_table, right_padding_to_left_padding
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 import functools
@@ -142,21 +144,21 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
-def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
-    table = Table(show_lines=True)
-    for column in df.columns:
-        table.add_column(column)
-    for _, row in df.iterrows():
-        table.add_row(*row.astype(str).tolist())
-    console.rule(f"[bold red]{title}")
-    console.print(table)
+# def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+#     table = Table(show_lines=True)
+#     for column in df.columns:
+#         table.add_column(column)
+#     for _, row in df.iterrows():
+#         table.add_row(*row.astype(str).tolist())
+#     console.rule(f"[bold red]{title}")
+#     console.print(table)
 
 
-def layer_init(layer:nn.Module, std=np.sqrt(2), bias_const=0.0):
-    # 初始化weight, bias
-    torch.nn.init.normal_(layer.weight, std=std)
-    torch.nn.init.constant_(layer.bias, val=bias_const)
-    return layer
+# def layer_init(layer:nn.Module, std=np.sqrt(2), bias_const=0.0):
+#     # 初始化weight, bias
+#     torch.nn.init.normal_(layer.weight, std=std)
+#     torch.nn.init.constant_(layer.bias, val=bias_const)
+#     return layer
 
 
 class AdaptiveKLController:
@@ -215,83 +217,84 @@ class AutoModelForCausalLMWithScalarHead(nn.Module):
 2. 由于这个reward只有最后一个token才有，因此监督信号极为稀疏
 3. 目前在一些新的RL中，都使用基于规则的reward来替换基于模型的reward
 """
-class AutoModelForCausalLMWithRewardHead(nn.Module):
-    def __init__(self, lm_backbone:AutoModelForCausalLM):
-        super().__init__()
-        self.lm_backbone:AutoModelForCausalLM = lm_backbone
-        self.scalar_head = layer_init(
-            nn.Linear(lm_backbone.config.hidden_size, 1),
-            std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
-        )
-        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+# class AutoModelForCausalLMWithRewardHead(nn.Module):
+#     def __init__(self, lm_backbone:AutoModelForCausalLM):
+#         super().__init__()
+#         self.lm_backbone:AutoModelForCausalLM = lm_backbone
+#         self.scalar_head = layer_init(
+#             nn.Linear(lm_backbone.config.hidden_size, 1),
+#             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
+#         )
+#         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+#         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
-    # 返回lm的output以及整个sentence的reward打分
-    def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
-        lm_output = self.lm_backbone(**kwargs)
-        # output.hidden_states:(layer_num+1) * [batch, seq_len, hidden_size], 在qwen2系列中，有layer_num+1层hidden_state, 原因是将最开始的input_embedding作为第0层的hidden_state
-        # reward_latents shape: [batch_size, length, hidden_size]
-        reward_latents = lm_output.hidden_states[-1] # 只取最后一层的hidden_states, 注意：reward model只取最后一层的hidden_state的最后一个token进行打分  
+#     # 返回lm的output以及整个sentence的reward打分
+#     def forward(self, **kwargs) ->Tuple[CausalLMOutputWithPast, TensorType["batch",1, float]]:
+#         lm_output = self.lm_backbone(**kwargs)
+#         # output.hidden_states:(layer_num+1) * [batch, seq_len, hidden_size], 在qwen2系列中，有layer_num+1层hidden_state, 原因是将最开始的input_embedding作为第0层的hidden_state
+#         # reward_latents shape: [batch_size, length, hidden_size]
+#         reward_latents = lm_output.hidden_states[-1] # 只取最后一层的hidden_states, 注意：reward model只取最后一层的hidden_state的最后一个token进行打分  
 
-        # last_reward_latents: [batch_size, hidden_size]
-        last_reward_latents = reward_latents[:, -1, :] # 最后一个token的hidden_states
-        # reward: [batch_size, 1], 句子级别的reward，即只有最后一个token才会有reward
-        reward = self.scalar_head(last_reward_latents)
-        # reward: [batch_size, 1]
-        reward = self.reward_gain * reward + self.reward_bias # 为何需要对reward进行缩放与平移
-        return lm_output, reward
+#         # last_reward_latents: [batch_size, hidden_size]
+#         last_reward_latents = reward_latents[:, -1, :] # 最后一个token的hidden_states
+#         # reward: [batch_size, 1], 句子级别的reward，即只有最后一个token才会有reward
+#         reward = self.scalar_head(last_reward_latents)
+#         # reward: [batch_size, 1]
+#         reward = self.reward_gain * reward + self.reward_bias # 为何需要对reward进行缩放与平移
+#         return lm_output, reward
 
-# tokens: Annotated["batch", "seq_len", int]
-# tokens: TensorType["batch", "seq_len", int]
-def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
-                                  pad_id:int) -> TensorType["batch", "seq_len", int]:
-    """Convert from right padding to left padding."""
-    # 将right padding转为left padding
-    # tokens:[batch, seq_len]
-    assert tokens.ndim == 2
-    left_padding_tokens = torch.tensor([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    ) #.long()
-    return left_padding_tokens
-
-
-def ceil_div(a, b):
-    return (a - 1) // b + 1
+# # tokens: Annotated["batch", "seq_len", int]
+# # tokens: TensorType["batch", "seq_len", int]
+# def right_padding_to_left_padding(tokens: TensorType["batch", "seq_len", int],
+#                                   pad_id:int) -> TensorType["batch", "seq_len", int]:
+#     """Convert from right padding to left padding."""
+#     # 将right padding转为left padding
+#     # tokens:[batch, seq_len]
+#     assert tokens.ndim == 2
+#     left_padding_tokens = torch.tensor([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
+#         device=tokens.device,
+#     ) #.long()
+#     return left_padding_tokens
 
 
-def exact_div(a, b):
-    q = a // b
-    if a != q * b:
-        raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
-    return q
+# def ceil_div(a, b):
+#     return (a - 1) // b + 1
 
-def generate(lm_backbone:AutoModelForCausalLM, 
-             queries:TensorType["batch", "seq_len", int], 
-             tokenizer:AutoTokenizer, 
-             generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
-    """generate in a way that does not affect padding tokens"""
-    # queries:[batch, seq_len]
-    context_length = queries.shape[1]
-    attention_mask = queries != tokenizer.pad_token_id # 左padding
-    # 可能是为了适配？将tokenizer_pad_id填充为0
-    # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
-    output = lm_backbone.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
-        generation_config=generation_config,
-        return_dict_in_generate=True,
-    )
-    # queries:[batch, seq_len=24]
-    # output.sequences:[batch, gen_seq_len=48]
-    # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,
-    # 之所以需要拼接，是因为从queryies中复制的input_ids中的对query里的pad_id替换为0了与原始queries中的pad_id不同
-    return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+
+# def exact_div(a, b):
+#     q = a // b
+#     if a != q * b:
+#         raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
+#     return q
+
+# def generate(language_model:AutoModelForCausalLM, 
+#              queries:TensorType["batch", "seq_len", int], 
+#              tokenizer:AutoTokenizer, 
+#              generation_config:GenerationConfig) -> TensorType["batch", "seq_len", int]:
+#     """generate in a way that does not affect padding tokens"""
+#     # 不影响padding token
+#     # queries:[batch, seq_len]
+#     context_length = queries.shape[1]
+#     attention_mask = queries != tokenizer.pad_token_id # 左padding
+#     # 可能是为了适配？将tokenizer_pad_id填充为0
+#     # position_ids=attention_mask.cumsum(1) - attention_mask.long(): 比较trick的做法，即从左到右开始累加，即为index, 减attention_mask是为了从0开始
+#     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+#     output = language_model.generate(
+#         input_ids=input_ids,
+#         attention_mask=attention_mask,
+#         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
+#         generation_config=generation_config,
+#         return_dict_in_generate=True,
+#     )
+#     # queries:[batch, seq_len=24]
+#     # output.sequences:[batch, gen_seq_len=48]
+#     # restore padding tokens, 每个output只从非query部分开始取生成的token,即query部分不要, 然后又将query与生成部分拼接,
+#     # 之所以需要拼接，是因为从queryies中复制的input_ids中的对query里的pad_id替换为0, 与原始queries中的pad_id不同
+#     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 def get_sentence_reward(reward_model:AutoModelForCausalLMWithRewardHead, 
-               query_responses:TensorType["batch", "seq_len", int], 
-               tokenizer:AutoTokenizer)->TensorType["batch",1, float]:
+                        query_responses:TensorType["batch", "seq_len", int], 
+                        tokenizer:AutoTokenizer)->TensorType["batch",1, float]:
     attention_mask = query_responses != tokenizer.pad_token_id
     # cumsum: 减attention_mask是为了从0开始
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
@@ -308,7 +311,7 @@ def get_sentence_reward(reward_model:AutoModelForCausalLMWithRewardHead,
     )
     return reward
 
-def get_policy_pred_and_critic_value(policy_model:AutoModelForCausalLMWithScalarHead, 
+def get_policy_pred_and_critic_value(actor_and_critic_model:AutoModelForCausalLMWithScalarHead, 
             query_responses:TensorType["batch", "seq_len", int], 
             tokenizer:AutoTokenizer)->Tuple[CausalLMOutputWithPast, TensorType['batch', 'seq_len', 1, float]]:
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -318,7 +321,7 @@ def get_policy_pred_and_critic_value(policy_model:AutoModelForCausalLMWithScalar
     input_ids[~attention_mask] = 0
     # critic_value: seq中的每个token都有critic value
     # V(st) = [x, y1,y2, ... , yt], 每个token都会有一个critic value
-    lm_pred, critic_value = policy_model.forward(
+    lm_pred, critic_value = actor_and_critic_model.forward(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -349,9 +352,9 @@ def show_some_data(name:str, data:torch.Tensor, tokenizer:PreTrainedTokenizer):
 def rollout_policy(global_step:int,
             update_ppo:int, 
             data:dict[str, Any | EncodingFast],   
-            policy:AutoModelForCausalLMWithScalarHead,
-            ref_policy:AutoModelForCausalLMWithScalarHead,
-            reward_model:AutoModelForCausalLMWithScalarHead,
+            actor_and_critic_model:AutoModelForCausalLMWithScalarHead,
+            ref_actor_and_critic_model:AutoModelForCausalLMWithScalarHead,
+            reward_model:AutoModelForCausalLMWithRewardHead,
             tokenizer:PreTrainedTokenizer,
             generation_config:GenerationConfig,
             device:torch.device,
@@ -368,9 +371,10 @@ def rollout_policy(global_step:int,
         queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
         print(f"sample data shape:{queries.shape}") # [batch=64, seq_len=64]
         show_some_data("queries", queries[0:3], tokenizer)
+        # 使用最新的actor policy生成response
         # query_responses:[batch, query_len+resp_len]
-        query_responses = generate(
-            accelerator.unwrap_model(policy).lm_backbone, # 预测时并不需要分布式
+        query_responses = generate_sequence(
+            accelerator.unwrap_model(actor_and_critic_model).lm_backbone, # 预测时并不需要分布式
             queries,
             tokenizer,
             generation_config,
@@ -382,26 +386,28 @@ def rollout_policy(global_step:int,
         # 1. 计算actor_policy的logprobs, 用于计算kl_divergence
         # policy_output: CausalLMOutputWithPast, full_critic_values
         # full_critic_values:[batch, query_len+resp_len, 1]           
-        policy_output, full_critic_values = get_policy_pred_and_critic_value(policy, query_responses, tokenizer)
+        policy_output, full_critic_values = get_policy_pred_and_critic_value(actor_and_critic_model, query_responses, tokenizer)
 
         # resp_critic_values: [batch, resp_len, 1] -> [batch, resp_len], 只取resp部分的critic value
         resp_critic_values = full_critic_values[:, context_length - 1 : -1].squeeze(-1)
+        # NOTE: 注意, 此次又重新前向计算了language model, 之前在generate时已经前向计算了language model!!!因为本次需要计算critic value
         # policy_output.logits:[batch, query_len+resp_len, vocab_size]
         # logits:[batch, resp_len, vocab_size]
         logits = policy_output.logits[:, context_length - 1 : -1] # 只取response部分的logits
         logits /= args.task.temperature
-        # all_logprobs: [batch, resp_len, vocab_size]
-        all_logprobs = F.log_softmax(logits, dim=-1)
-        # all_logprobs:[batch, resp_len, vocab_size]
+        # resp_logprobs: [batch, resp_len, vocab_size]
+        resp_logprobs = F.log_softmax(logits, dim=-1)
+
+        # resp_logprobs:[batch, resp_len, vocab_size]
         # responses:[batch, resp_len], type:int
-        # gather:out[i][j][k] = all_logprobs[i][j][index[i][j][k]], 即收集所有token的logprobs
+        # gather:out[i][j][k] = resp_logprobs[i][j][index[i][j][k]], 即收集所有token的logprobs
         # logprobs:[batch, resp_len]
-        logprobs = torch.gather(all_logprobs, dim=2, index=responses.unsqueeze(-1)).squeeze(-1)
-        del policy_output, logits, all_logprobs
+        logprobs = torch.gather(resp_logprobs, dim=2, index=responses.unsqueeze(-1)).squeeze(-1)
+        del policy_output, logits, resp_logprobs
         torch.cuda.empty_cache() # 释放缓存的显存
 
         # 2. 计算ref_policy的logprobs, 用于计算kl_divergence
-        ref_output, _ = get_policy_pred_and_critic_value(ref_policy, query_responses, tokenizer)
+        ref_output, _ = get_policy_pred_and_critic_value(ref_actor_and_critic_model, query_responses, tokenizer)
         ref_logits = ref_output.logits[:, context_length - 1 : -1] # 只取resp部分
         ref_logits /= args.task.temperature
         ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
@@ -416,8 +422,7 @@ def rollout_policy(global_step:int,
         # truncate_token_mask:[batch, resp_len]
         truncate_token_mask = responses == args.task.truncate_token # 以句号"."将句子分隔为前部分与后部分
         # 在truncate_after个token以内的truncate_token均忽略, 在truncate_after后开始计算第一个truncate_token出现的位置作为有效truncate_token
-        truncate_after_or_token_mask = torch.cat(
-            [
+        truncate_after_or_token_mask = torch.cat([
                 torch.zeros_like(truncate_token_mask)[:, : args.task.min_token_num_of_truncate], # 前truncate_after=16个token mask为0
                 truncate_token_mask[:, args.task.min_token_num_of_truncate :], # truncate_after=16后的token mask为原来的truncate_token_mask
             ],
@@ -426,8 +431,7 @@ def rollout_policy(global_step:int,
         # truncate_mask:[batch, resp_len], 只要句子中在min_token_num_of_truncate后出现truncate_token后，mask将一直为True
         truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
         # postprocessed_responses:[batch, resp_len], 将responses中trunkcate_mask=True的地方填pad_token, 即response在16个token出现了句号之后,全部设为pad_token
-        postprocessed_responses = torch.where(
-            condition=truncate_mask,
+        postprocessed_responses = torch.where(condition=truncate_mask,
             input=torch.full_like(responses, tokenizer.pad_token_id),
             other=responses,
         )
@@ -444,7 +448,7 @@ def rollout_policy(global_step:int,
         postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
         # 计算query+response的reward分数, 每个句子只有一个reward分数，而不是每个token均有一个分数
         # reward_scores_from_model:[batch], 利用query+resp计算score 
-        reward_scores_from_model = get_sentence_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
+        reward_scores_from_model = get_sentence_reward(reward_model, query_responses=postprocessed_query_responses, tokenizer=tokenizer).flatten()
 
         # 3. filter response by truncate_token. 
         # Ensure that the sample contains truncate_token responses not passing that filter will receive a low (fixed) score
@@ -454,16 +458,16 @@ def rollout_policy(global_step:int,
         # postprocessed_responses:[batch, resp_len]
         matches_token = postprocessed_responses[:, args.task.min_token_num_of_truncate :] == args.task.truncate_token
         filter_mask = torch.any(matches_token, dim=-1) # 该句子resp中是否有truncate_token
-        # 如果句子resp中含有truncate_token,则保留原始reward,否则给予-1分惩罚
-        # reward_scores:[batch]
-        reward_scores_from_model = torch.where(filter_mask,
-            reward_scores_from_model,
+        # 利用格式修正reward: 如果句子resp中含有truncate_token,则保留原始reward,否则给予-1分惩罚, 即必须有EOS token
+        # reward_scores_from_model:[batch], 每个句子的reward,标量
+        reward_scores_from_model = torch.where(filter_mask, reward_scores_from_model,
             torch.full_like(reward_scores_from_model, args.task.penalty_reward_value),
         )
         del matches_token, filter_mask
         torch.cuda.empty_cache()
 
-        # 4. compute rewards
+        # 4. compute rewards = - kl_divergence + reward_score(scalar)
+        # 
         # logprobs:[batch, resp_len]
         # ref_logprobs:[batch, resp_len]
         # kl_divergence(p||q) = sum_x[ p(x)log(p(x)/q(x)) ] 
@@ -471,17 +475,19 @@ def rollout_policy(global_step:int,
         # = p(x)log(p(x)) - p(x)log(q(x))
         # = -p(x)log(q(x)) - (-p(x)log(p(x)))
         # = cross_entropy - entropy 
+        #
         # 其物理意义为:
         # 熵:分布为p的数据,用分布p的熵所需的编码长度为1/(p(x))
         # 交叉熵:分布为p的数据,用分布q的熵所需的编码长度为q(x)/(p(x))
         # KL距离:用交叉熵比用熵编码多出的平均编码长度
         kl_divergence = logprobs - ref_logprobs
-        # non_score_reward:[batch, resp_len]
+        # negative_kl_reward:[batch, resp_len]
         negative_kl_reward = -kl_ctl.value * kl_divergence # KL散度取负作为reward
-        # rewards:[batch, resp_len]
+        # 注意：这里并没有LM loss, 因为kl divergence可以间接体现lm loss
+        # total_rewards:[batch, resp_len]
         total_rewards = negative_kl_reward.clone()
-        # 在每个句子的最后一个token上加上句子级别的reward，该reward来自于reward模型打分
-        # reward_scores:[batch]
+        # NOTE: 在每个句子的**最后**一个token上加上句子级别的reward，该reward来自于reward模型打分
+        # reward_scores_from_model:[batch]
         total_rewards[:, -1] += reward_scores_from_model
 
         # 5. whiten rewards
@@ -507,7 +513,8 @@ def rollout_policy(global_step:int,
                 })
                 if accelerator.is_main_process and args.track:
                     import wandb
-                    wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update_ppo)
+                    wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update_ppo) # 可以用来记录rl训练过程中的response变化
+
                 # 打印
                 print_rich_table(f"Sample Output at Episode {global_step}", all_df[:4], console)
 
@@ -519,21 +526,28 @@ def rollout_policy(global_step:int,
         torch.cuda.empty_cache()
 
         # 6. compute advantages and returns
-        # 在计算了total_reward之后，使用GAE方式平滑reward
+        # NOTE: 在计算了reward之后，使用GAE方式平滑reward
         """
         Compute generalized advantage estimate. 
         GAE: 在低方差与低偏置中取得平衡
         
-        TD error:
+        一步TD error:
         delta(t) = R(t) + gamma * V(t+1) - V(t), 这就是TD_ERROR
+        TD_target = R(t) + gamma * V(t+1), 用立即回报与下一步的critic value估计值之和来近似当前状态的价值函数
+        Q(s,a) = R(t) + gamma * V(t+1)
+        如果没有GAE，则使用一阶TD target有: discount_return = Q(s,a) = R(t) + gamma*V(t+1)
+        而如果使用GAE，则使用多步TD target有: discount_return = Q(s,a) = GAE(t) + V(s_t)
 
         GAE:
-        A(t) = sum_{t} {lamada*gamma}^{l}*delta_{t+l}
-        GAE递推表示： A(t) = delta(t) + gamma * lambda * A(t+1)
+        A(t) = sum_{l} {lambda*gamma}^{l}*delta_{t+l}, 为多个多步的TD_ERROR加权求和, 
+        即delta(t) + gamma * lambda * delta(t+1) + (gamma*lambda)^2*delta(t+2) +(gamma*lambda)^3*delta(t+3)+...
+
+        GAE递推公式： A(t) = delta(t) + gamma * lambda * A(t+1)
+
 
         递归推导：
-        A(t) = delta(t)+gamma*lambda*delta(t+1)+ (gamma*lambda)^2*delta(t+2) +(gamma*lambda)^3*delta(t+3)+...
-        A(t+1) = delta(t+1)+gamma*lambda*delta(t+2)+ (gamma*lambda)^2*delta(t+3) +(gamma*lambda)^3*delta(t+4)+...
+        A(t) =   delta(t)  +gamma*lambda*delta(t+1)+ (gamma*lambda)^2*delta(t+2) +(gamma*lambda)^3*delta(t+3)+...
+        A(t+1)=  delta(t+1)+gamma*lambda*delta(t+2)+ (gamma*lambda)^2*delta(t+3) +(gamma*lambda)^3*delta(t+4)+...
         =>
         A(t) = delta(t)+gamma*lambda*[delta(t+1)+gamma*lambda*delta(t+2)+ (gamma*lambda)^2*delta(t+3) +(gamma*lambda)^3*delta(t+4)+...]
         因此有
@@ -562,33 +576,35 @@ def rollout_policy(global_step:int,
             advantages_reversed.append(advantage)
 
         """
-        advantage用来计算policy loss, discount_rewards用来计算critic loss
+        advantage用来计算policy loss, discount_return用来计算critic loss
         """
         # advantages:[batch, resp_len]
         advantages = torch.stack(advantages_reversed[::-1], axis=1) 
 
         """
-        discount_rewards: 代表从实际轨迹中观测到的、折扣后的累积回报，是强化学习中的"真实标签", 用于训练critic网络，使其预测更接近真实的累积回报
-        后续通常会这样使用： value_loss = F.mse_loss(predicted_values, discount_rewards)  # 让critic预测接近真实回报
+        discount_returns: 代表从实际轨迹中观测到的、折扣后的累积回报，是强化学习中的"真实标签", 用于训练critic网络，使其预测更接近真实的累积回报
+        后续通常会这样使用： value_loss = F.mse_loss(predicted_values, discount_returns)  # 让critic预测接近真实回报
 
-        discount_rewards = advantages + values
+        discount_returns = advantages + values
         = A(s_t, a_t) + V(s_t)
         = [Q(s_t, a_t) - V(s_t)] + V(s_t)
         = Q(s_t, a_t)
+
+        => discount_returns = Q(s,a) = A(s_t, a_t) + V(s_t)
         """
         # 优势advantage = A(s,a) = Q(s,a) - V(t) = R(t) + gamma*V(t+1) - V(t)
         # => Q(s,a) = A(s,a) + V(t), 其中Q(s, a)即为td target 的reward
         # resp_critic_values:[batch, resp_len]
         # advantages:[batch, resp_len]
         # =>
-        # discount_rewards:[batch, resp_len]
-        discount_rewards = advantages + resp_critic_values # Q(s,a) = A(s,a) + V(t)
+        # discount_returns:[batch, resp_len]
+        discount_returns = advantages + resp_critic_values # Q(s,a) = A(s,a) + V(t)
         advantages = whiten(advantages)
-        discount_reward_mean, discount_reward_var = discount_rewards.mean(), discount_rewards.var()
+        discount_return_mean, discount_return_var = discount_returns.mean(), discount_returns.var()
         critic_value_mean, critic_value_var = resp_critic_values.mean(), resp_critic_values.var()
 
         return {
-            'discount_rewards': discount_rewards,
+            'discount_returns': discount_returns,
             'advantages': advantages,
             'resp_critic_values': resp_critic_values,
             'responses': responses,
@@ -597,20 +613,19 @@ def rollout_policy(global_step:int,
             'context_length': context_length,
             'ref_logprobs': ref_logprobs,
             'negative_kl_reward': negative_kl_reward,
-            'discount_reward_mean': discount_reward_mean,
-            'discount_reward_var': discount_reward_var,
+            'discount_reward_mean': discount_return_mean,
+            'discount_reward_var': discount_return_var,
             'critic_value_mean': critic_value_mean,
             'critic_value_var': critic_value_var,
             'reward_scores_from_model': reward_scores_from_model,
         }
 
-
 def update_policy(accelerator:Accelerator, 
-            policy:AutoModelForCausalLMWithScalarHead,
+            actor_and_critic_model:AutoModelForCausalLMWithScalarHead,
             tokenizer:PreTrainedTokenizer,
             args:Args,  
             console:Console,
-            discount_rewards:torch.Tensor,
+            discount_returns:torch.Tensor,
             advantages:torch.Tensor,
             resp_critic_values:torch.Tensor,
             responses:torch.Tensor,
@@ -626,17 +641,17 @@ def update_policy(accelerator:Accelerator,
             entropies_stats:TensorType["num_epoch_per_update", "local_batch_size", "gradient_accumulation_steps"],
             ):
     # 2. 每次从上面的样本中采样小部分样本，并更新若干次模型
-    for ppo_epoch_idx in range(args.ppo.num_epoch_per_update):
-        batch_inds = np.random.permutation(args.ppo.local_batch_size)
+    for ppo_epoch_idx in range(args.ppo.num_epoch_per_update): # 4
+        batch_inds = np.random.permutation(args.ppo.local_batch_size) # 32
         minibatch_idx = 0
-        for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
+        for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size): # 8
             mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
             mini_batch_inds = batch_inds[mini_batch_start:mini_batch_end]
-            gradient_accumulation_idx = 0
-            gradient_accumulation_steps = args.ppo.local_mini_batch_size // args.ppo.local_micro_batch_size
+            #gradient_accumulation_idx = 0
+            gradient_accumulation_steps = args.ppo.local_mini_batch_size // args.ppo.local_micro_batch_size # 8//4=2
             #for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
             for gradient_accumulation_idx in range(0, gradient_accumulation_steps):
-                with accelerator.accumulate(policy):
+                with accelerator.accumulate(actor_and_critic_model): # accelerator在声明时就已经设置的梯度累加模式
                     """
                     with accelerator.accumulate(policy) 是 Hugging Face Accelerate 库提供的梯度累积上下文管理器
 
@@ -663,20 +678,22 @@ def update_policy(accelerator:Accelerator,
                     micro_batch_start = gradient_accumulation_idx * args.ppo.local_micro_batch_size
                     micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
                     micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                    mb_discount_rewards = discount_rewards[micro_batch_inds] # [batch, resp_len]
+                    mb_discount_returns = discount_returns[micro_batch_inds] # [batch, resp_len]
                     mb_advantage = advantages[micro_batch_inds] # [batch, resp_len]
                     mb_values = resp_critic_values[micro_batch_inds] # [batch, resp_len]
-                    mb_responses = responses[micro_batch_inds] # [batch ,resp_len]
+                    mb_responses = responses[micro_batch_inds] # [batch, resp_len]
                     mb_query_responses = query_responses[micro_batch_inds] # [batch, query_len+resp_len]
                     mb_old_logprobs = logprobs[micro_batch_inds] # logprobs:[batch, resp_len]
 
                     """
-                    将采样到的样本，使用当前最新的actor policy/critic进行前向传播，得到新的logits和critic value, 分别计算policy loss和critic loss
+                    将采样到的样本，使用当前最新的actor policy/critic model进行前向传播，得到新的logits和critic value, 分别计算policy loss和critic loss
                     1. 先计算critic loss
                     2. 再计算policy loss
+
+                    注意：此处是对query+response部分的logits进行计算
                     """
                     # new_critic_value:[batch, query_len+resp_len, 1]
-                    new_policy_output, new_critic_value = get_policy_pred_and_critic_value(policy, mb_query_responses, tokenizer)
+                    new_policy_output, new_critic_value = get_policy_pred_and_critic_value(actor_and_critic_model, mb_query_responses, tokenizer)
                     # new_policy_logits:[batch, resp_len, vocab_size]
                     new_policy_resp_logits = new_policy_output.logits[:, context_length - 1 : -1]
                     new_policy_resp_logits /= args.task.temperature
@@ -687,13 +704,10 @@ def update_policy(accelerator:Accelerator,
                     # new_pred_resp_critic:[batch, resp_len]
                     new_pred_resp_critic = new_critic_value[:, context_length - 1 : -1].squeeze(-1) # 只取response部分的critic value
                     # new_pred_resp_critic_clipped:[batch, resp_len]
-                    new_pred_resp_critic_clipped = torch.clamp(
-                        new_pred_resp_critic,
-                        mb_values - args.ppo.cliprange_value,
-                        mb_values + args.ppo.cliprange_value,
-                    )
-                    vf_critic_losses_no_clip = torch.square(new_pred_resp_critic - mb_discount_rewards)
-                    vf_critic_losses_clipped = torch.square(new_pred_resp_critic_clipped - mb_discount_rewards)
+                    new_pred_resp_critic_clipped = torch.clamp(new_pred_resp_critic, min=mb_values - args.ppo.cliprange_value, max=mb_values + args.ppo.cliprange_value)
+                    # NOTE: MSE = [V_new(t) - R(t)]^2 = [V_new(t) -(GAE(t) + V_old(t)) ]^2
+                    vf_critic_losses_no_clip = torch.square(new_pred_resp_critic - mb_discount_returns)
+                    vf_critic_losses_clipped = torch.square(new_pred_resp_critic_clipped - mb_discount_returns)
                     # 1. 计算critic loss,为平方loss
                     # vf_critic_loss: float, critic预测的value值不能差太多, 即V(st)
                     vf_critic_loss = 0.5 * torch.max(vf_critic_losses_no_clip, vf_critic_losses_clipped).mean()
@@ -701,20 +715,21 @@ def update_policy(accelerator:Accelerator,
                     # 因为clipped后的值范围更小，所以与mb_discount_rewards的差距会更大，因此可以用下面的计算clipped占比
                     vf_critic_clipfrac = (vf_critic_losses_clipped > vf_critic_losses_no_clip).float().mean() # clipped的占比
 
-                    # policy ppo loss
+
+                    # 2. PPO loss
+                    # policy_gradient_Loss = Expect_{x~Pai(old)} { Pai(new)/Pai(old) *Advantage(Pai(old))}
+                    # Advantage(Pai(old)) = GAE(st, at) = Q(st, at) - V(st)
+
                     # mb_logprobs:[batch, resp_len], 老策略的logits
                     # new_logprobs:[batch, resp_len], ppo更新后online新策略的logits
                     logprobs_diff = new_logprobs - mb_old_logprobs # [batch, resp_len]
-
-                    # ppo公式
-                    # policy_gradient_Loss = Expect_{x~Pai(old)} { Pai(new)/Pai(old) *Advantage(Pai(old))}
                     # 重要性采样的比率
                     importance_sampling_ratio = torch.exp(logprobs_diff) # [batch, resp_len]
-                    pg_advantage_no_clip = mb_advantage * importance_sampling_ratio # [batch, resp_len], PPO 的公式：Pai/Pai(old)*Advantage(st, at)
-                    pg_advantage_clipped = mb_advantage * torch.clamp(importance_sampling_ratio, min=1.0 - args.ppo.cliprange, max=1.0 + args.ppo.cliprange)
                     # pg_loss_no_clip:[batch, resp_len]
                     # pg_loss_clipped:[batch, resp_len]
-                    # pg_loss:float, 对batch*resp_len求了平均，因此是一个scalar,mean也防止了长度带来的reward的偏置问题
+                    pg_advantage_no_clip = mb_advantage * importance_sampling_ratio # [batch, resp_len], PPO 的公式：Pai/Pai(old)*Advantage(st, at)
+                    pg_advantage_clipped = mb_advantage * torch.clamp(importance_sampling_ratio, min=1.0 - args.ppo.cliprange, max=1.0 + args.ppo.cliprange)
+
                     """
                     2. 计算policy loss,为advantage取反
 
@@ -723,6 +738,7 @@ def update_policy(accelerator:Accelerator,
                             clip(Pai(new)/Pai(old), 1-episilon, 1+episilon)* Advantage(Pai(old))
                        )
                     """
+                    # pg_loss:float, 对batch*resp_len求了平均，因此是一个scalar,mean也防止了长度带来的reward的偏置问题
                     pg_loss = -torch.min(pg_advantage_no_clip, pg_advantage_clipped).mean() # 
                     pg_advantage_clipfrac = (pg_advantage_clipped < pg_advantage_no_clip).float().mean() # 计算clip的比例 
 
@@ -733,7 +749,7 @@ def update_policy(accelerator:Accelerator,
                     optimizer.step()
                     optimizer.zero_grad()
                     # logits, prob_dist: [batch, resp_len, vocab_size]
-                    prob_dist = torch.nn.functional.softmax(new_policy_resp_logits, dim=-1)
+                    new_policy_resp_probs = torch.nn.functional.softmax(new_policy_resp_logits, dim=-1)
 
                     """
                     pi=exp(xi)/sum(exp(xi))
@@ -742,6 +758,7 @@ def update_policy(accelerator:Accelerator,
                         = -pi*log(exp(xi)) + pi*log(sum(exp(xi)))
                         = -pi*xi + pi*log(sum(exp(xi)))
                         = pi*log(sum(exp(xi))) - pi*xi
+                    因此，entropy = sum(pi*log(sum(exp(xi))) - pi*xi)
 
                     因此entropy = sum(-pi*xi+pi*log(sum(exp(xi)))) 
                     对应于下式中：logits = xi, prob_dist=pi
@@ -749,9 +766,9 @@ def update_policy(accelerator:Accelerator,
 
                     注意：此处熵仅用于观测，也没有计算policy与ref_policy之间的KL散度loss
                     """
-                    # entropy:[batch, resp_len, vocab_size], 计算policy的LM的熵
+                    # entropy:[batch, resp_len], 计算policy的LM的熵
                     # 计算policy的熵,熵越大，代表policy多样性越高
-                    entropy = torch.logsumexp(new_policy_resp_logits, dim=-1) - torch.sum(prob_dist * new_policy_resp_logits, dim=-1) 
+                    entropy = torch.logsumexp(new_policy_resp_logits, dim=-1) - torch.sum(new_policy_resp_probs * new_policy_resp_logits, dim=-1) 
                     # logprobs_diff: [batch, resp_len]
                     # approxkl: float
                     approxkl = 0.5 * (logprobs_diff**2).mean()
@@ -763,7 +780,7 @@ def update_policy(accelerator:Accelerator,
                         vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_critic_clipfrac
                         entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
 
-                gradient_accumulation_idx += 1
+                #gradient_accumulation_idx += 1
             minibatch_idx += 1
 
             if accelerator.is_main_process:
@@ -844,6 +861,7 @@ def train(args: Args):
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
+    # reward model：对每个句子只计算一个score
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         #reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
@@ -855,14 +873,14 @@ def train(args: Args):
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
 
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
-    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    ref_actor_and_critic_model = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    actor_and_critic_model = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     # 不知为何需要禁用policy的eos_token, pad_token
-    policy.lm_backbone.generation_config.eos_token_id = (
+    actor_and_critic_model.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
-    policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    actor_and_critic_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    optimizer = optim.Adam(actor_and_critic_model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     #dataset = load_dataset("bookcorpus", split="train")
     dataset = load_dataset("json", split='train', data_files={
         "train":"../data/bookcorpus/*.jsonl",
@@ -875,7 +893,7 @@ def train(args: Args):
     # 奇怪的是，此处并没有collator函数
     dataset.set_transform(functools.partial(process_query_data, tokenizer=tokenizer_for_query, response_length=args.task.query_length))
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
-    policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
+    actor_and_critic_model, optimizer, dataloader = accelerator.prepare(actor_and_critic_model, optimizer, dataloader)
 
     if args.deepspeed:
         import deepspeed
@@ -899,13 +917,13 @@ def train(args: Args):
             "wall_clock_breakdown": False,
         }
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
-        ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=eval_ds_config)
+        ref_actor_and_critic_model, *_ = deepspeed.initialize(model=ref_actor_and_critic_model, config=eval_ds_config)
     else:
-        ref_policy = ref_policy.to(device)
+        ref_actor_and_critic_model = ref_actor_and_critic_model.to(device)
         reward_model = reward_model.to(device)
 
     reward_model.eval() # 注意, reward_model不再更新
-    ref_policy.eval() # 注意, policy_model不再更新
+    ref_actor_and_critic_model.eval() # 注意, policy_model不再更新
 
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
@@ -936,6 +954,24 @@ def train(args: Args):
     vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
     entropies_stats = torch.zeros(stats_shape, device=device)
     
+    """
+    1. 模型个数 = 4
+    actor policy model
+    critic model(每个token均有打分, token level score)
+    reward model(sequence level reward, 对于数学类问题可用规则打分替代)
+    ref policy model
+
+    当前程序中的loss
+    1. actor policy model 与 ref policy model之间计算kl loss
+    2. critic model与GAE计算MSE loss
+    3. actor model与GAE计算ppo loss
+
+    标准的RLHF中应该有的loss
+    1. critic model与GAE计算MSE loss
+    2. policy model计算language model loss
+    3. actor model与GAE计算ppo loss
+
+    """
     # policy model更新多少次
     for update_ppo_idx in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
@@ -948,8 +984,8 @@ def train(args: Args):
         # ===================================
         # 1. 先用actor(policy)生一批回答，得到一批样本： 即利用当前policy生成一批query的response, 即rollout
         # ===================================
-        rollout_result = rollout_policy(global_step, update_ppo_idx, data, policy, ref_policy, reward_model, tokenizer, generation_config, device, args, accelerator, console, kl_ctl)
-        discount_rewards = rollout_result['discount_rewards']
+        rollout_result = rollout_policy(global_step, update_ppo_idx, data, actor_and_critic_model, ref_actor_and_critic_model, reward_model, tokenizer, generation_config, device, args, accelerator, console, kl_ctl)
+        discount_returns = rollout_result['discount_returns']
         advantages = rollout_result['advantages']
         resp_critic_values = rollout_result['resp_critic_values']
         responses = rollout_result['responses']
@@ -967,7 +1003,7 @@ def train(args: Args):
         # ===================================
         # 2. 每次从上面的样本中采样小部分样本，并更新若干次模型
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-        update_result = update_policy(accelerator, policy, tokenizer, args, console, discount_rewards, 
+        update_result = update_policy(accelerator, actor_and_critic_model, tokenizer, args, console, discount_returns, 
                                       advantages, resp_critic_values, responses, query_responses,
                                       logprobs, context_length, optimizer, approxkls_stats,
                                       clipfracs_stats, pg_losses_stats, vf_losses_stats, 
@@ -1036,7 +1072,7 @@ def train(args: Args):
     # ===================================
     if args.save_path:
         #accelerator.save_model(policy, args.save_path)
-        torch.save(accelerator.unwrap_model(policy).state_dict(), args.save_path+"/pytorch.bin")
+        torch.save(accelerator.unwrap_model(actor_and_critic_model).state_dict(), args.save_path+"/pytorch.bin")
 
 
     if accelerator.is_main_process:
