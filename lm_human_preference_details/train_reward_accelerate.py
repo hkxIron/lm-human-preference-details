@@ -764,7 +764,7 @@ def train(args: Args):
         )
         print(
             "after normalization. "
-            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
             + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
