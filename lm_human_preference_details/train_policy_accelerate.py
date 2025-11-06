@@ -705,7 +705,7 @@ def update_policy(accelerator:Accelerator,
                     new_pred_resp_critic = new_critic_value[:, context_length - 1 : -1].squeeze(-1) # 只取response部分的critic value
                     # new_pred_resp_critic_clipped:[batch, resp_len]
                     new_pred_resp_critic_clipped = torch.clamp(new_pred_resp_critic, min=mb_values - args.ppo.cliprange_value, max=mb_values + args.ppo.cliprange_value)
-                    # NOTE: MSE = [V_new(t) - R(t)]^2 = [V_new(t) -(GAE(t) + V_old(t)) ]^2
+                    # NOTE: critic loss,  MSE = [V_new(t) - R(t)]^2 = [V_new(t) -(GAE(t) + V_old(t)) ]^2
                     vf_critic_losses_no_clip = torch.square(new_pred_resp_critic - mb_discount_returns)
                     vf_critic_losses_clipped = torch.square(new_pred_resp_critic_clipped - mb_discount_returns)
                     # 1. 计算critic loss,为平方loss
@@ -716,7 +716,7 @@ def update_policy(accelerator:Accelerator,
                     vf_critic_clipfrac = (vf_critic_losses_clipped > vf_critic_losses_no_clip).float().mean() # clipped的占比
 
 
-                    # 2. PPO loss
+                    # 2. NOTE: PPO loss
                     # policy_gradient_Loss = Expect_{x~Pai(old)} { Pai(new)/Pai(old) *Advantage(Pai(old))}
                     # Advantage(Pai(old)) = GAE(st, at) = Q(st, at) - V(st)
 
