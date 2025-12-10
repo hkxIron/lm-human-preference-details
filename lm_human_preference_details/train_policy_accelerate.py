@@ -444,9 +444,9 @@ def rollout_policy(global_step:int,
         # postprocessed_query_responses:[batch, query_len+resp_len]
         postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
         show_some_data("postprocessed_query_responses",postprocessed_query_responses[:3], tokenizer)
-        # right_pading没必要，因为本身已经是left_padding
+        # right_pading_to_left_padding没必要，因为本身已经是left_padding
         postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
-        # 计算query+response的reward分数, 每个句子只有一个reward分数，而不是每个token均有一个分数
+        # 利用reward模型计算query+response的reward分数, 每个句子只有一个reward分数，而不是每个token均有一个分数
         # reward_scores_from_model:[batch], 利用query+resp计算score 
         reward_scores_from_model = get_sentence_reward(reward_model, query_responses=postprocessed_query_responses, tokenizer=tokenizer).flatten()
 
@@ -474,7 +474,8 @@ def rollout_policy(global_step:int,
         # = - sum_x[ p(x)log(q(x)/p(x)) ] 
         # = p(x)log(p(x)) - p(x)log(q(x))
         # = -p(x)log(q(x)) - (-p(x)log(p(x)))
-        # = cross_entropy - entropy 
+        # = cross_entropy - entropy
+        # = H(p,q) - H(p)
         #
         # 其物理意义为:
         # 熵:分布为p的数据,用分布p的熵所需的编码长度为1/(p(x))
@@ -543,6 +544,7 @@ def rollout_policy(global_step:int,
         即delta(t) + gamma * lambda * delta(t+1) + (gamma*lambda)^2*delta(t+2) +(gamma*lambda)^3*delta(t+3)+...
 
         GAE递推公式： A(t) = delta(t) + gamma * lambda * A(t+1)
+        GAE的物理意义就是多个delta(t)关于lambda的指数加权平均
 
 
         递归推导：
@@ -959,11 +961,11 @@ def train(args: Args):
     actor policy model
     critic model(每个token均有打分, token level score)
     reward model(sequence level reward, 对于数学类问题可用规则打分替代)
-    ref policy model
+    ref policy model(用于计算kl散度)
 
     当前程序中的loss
     1. actor policy model 与 ref policy model之间计算kl loss
-    2. critic model与GAE计算MSE loss
+    2. critic model与Rt+gamma*V(t+1)计算MSE loss
     3. actor model与GAE计算ppo loss
 
     标准的RLHF中应该有的loss
